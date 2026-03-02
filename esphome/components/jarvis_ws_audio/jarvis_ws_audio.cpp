@@ -49,6 +49,7 @@ static constexpr uint32_t RECONNECT_MIN_MS = 1000;
 static constexpr uint32_t RECONNECT_MAX_MS = 30000;
 static constexpr uint32_t PING_INTERVAL_MS = 30000;
 static constexpr uint32_t CONNECT_TIMEOUT_MS = 10000;
+static constexpr uint32_t WS_WATCHDOG_TIMEOUT_MS = 90000;  // Force reconnect if no data for 90s
 
 // =============================================================================
 // SETUP
@@ -161,6 +162,24 @@ void JarvisWsAudio::loop() {
     // TODO: read from microphone, encode Opus, send continuously
     // This enables server-side openWakeWord detection
     // Same logic as AtomS3R's #ifndef USE_LOCAL_WAKEWORD block
+  }
+
+  // --- Connection watchdog ---
+  // If stuck in CONNECTING for too long, force disconnect and retry
+  if (this->conn_state_ == ConnState::CONNECTING &&
+      now - this->last_reconnect_attempt_ms_ > CONNECT_TIMEOUT_MS) {
+    ESP_LOGW(TAG, "Connection attempt timed out, forcing disconnect");
+    this->disconnect_ws_();
+    return;
+  }
+
+  // If connected but no data received for a long time, force reconnect
+  if (this->conn_state_ >= ConnState::CONNECTED &&
+      now - this->last_data_ms_ > WS_WATCHDOG_TIMEOUT_MS) {
+    ESP_LOGW(TAG, "No data from server for %us, forcing reconnect",
+             WS_WATCHDOG_TIMEOUT_MS / 1000);
+    this->disconnect_ws_();
+    return;
   }
 
   // --- Keepalive ping ---
@@ -387,11 +406,13 @@ void JarvisWsAudio::on_ws_event_(int32_t event_id, esp_websocket_event_data_t *d
       this->voice_phase_ = PHASE_IDLE;
       this->reconnect_delay_ms_ = RECONNECT_MIN_MS;
       this->last_ping_ms_ = millis();
+      this->last_data_ms_ = millis();
       // Send hello
       this->send_hello_();
       break;
 
     case WEBSOCKET_EVENT_DATA:
+      this->last_data_ms_ = millis();
       if (data->op_code == 0x01 && data->data_ptr && data->data_len > 0) {
         // Text frame: JSON control message
         this->on_ws_text_message_(data->data_ptr, data->data_len);
@@ -415,6 +436,14 @@ void JarvisWsAudio::on_ws_event_(int32_t event_id, esp_websocket_event_data_t *d
       this->voice_phase_ = PHASE_NOT_READY;
       this->audio_session_active_ = false;
       this->mic_stop_pending_ = true;  // defer mic stop to main loop
+      break;
+
+    case WEBSOCKET_EVENT_CLOSED:
+      ESP_LOGW(TAG, "WebSocket closed cleanly");
+      this->conn_state_ = ConnState::DISCONNECTED;
+      this->voice_phase_ = PHASE_NOT_READY;
+      this->audio_session_active_ = false;
+      this->mic_stop_pending_ = true;
       break;
 
     default:

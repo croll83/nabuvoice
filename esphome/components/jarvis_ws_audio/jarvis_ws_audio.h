@@ -126,10 +126,11 @@ class JarvisWsAudio : public Component {
   int16_t *enc_input_buffer_{nullptr};
   uint8_t *enc_output_buffer_{nullptr};
 
-  // --- Reconnection ---
+  // --- Reconnection & watchdog ---
   uint32_t reconnect_delay_ms_{1000};
   uint32_t last_reconnect_attempt_ms_{0};
   uint32_t last_ping_ms_{0};
+  uint32_t last_data_ms_{0};  // last time we received any WS data (for watchdog)
 
   // --- Audio buffer for microphone data ---
   // ESPHome microphone provides data via callback (uint8_t); we accumulate here
