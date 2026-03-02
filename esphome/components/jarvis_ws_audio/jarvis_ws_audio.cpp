@@ -23,6 +23,7 @@
 #include "jarvis_ws_audio.h"
 #include "esphome/core/log.h"
 #include "esphome/core/application.h"
+#include "esphome/components/network/util.h"
 
 #include <cstring>
 #include <cJSON.h>
@@ -101,6 +102,15 @@ void JarvisWsAudio::loop() {
 
   // --- Connection management ---
   if (this->conn_state_ == ConnState::DISCONNECTED) {
+    // Clean up stale client (with auto-reconnect disabled, task has exited)
+    if (this->ws_client_) {
+      esp_websocket_client_destroy(this->ws_client_);
+      this->ws_client_ = nullptr;
+    }
+    // Don't attempt to connect until WiFi is ready
+    if (!network::is_connected()) {
+      return;
+    }
     // Reconnect with exponential backoff
     if (now - this->last_reconnect_attempt_ms_ >= this->reconnect_delay_ms_) {
       this->last_reconnect_attempt_ms_ = now;
@@ -306,13 +316,6 @@ void JarvisWsAudio::build_ws_url_(char *buf, size_t buf_size) {
 }
 
 bool JarvisWsAudio::connect_ws_() {
-  // Clean up any existing client before creating a new one
-  if (this->ws_client_) {
-    esp_websocket_client_stop(this->ws_client_);
-    esp_websocket_client_destroy(this->ws_client_);
-    this->ws_client_ = nullptr;
-  }
-
   char url[384];
   this->build_ws_url_(url, sizeof(url));
   ESP_LOGI(TAG, "Connecting to %s", url);
