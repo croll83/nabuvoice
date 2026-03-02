@@ -80,6 +80,9 @@ class JarvisWsAudio : public Component {
   bool is_streaming() const { return this->audio_session_active_; }
   ConnState get_conn_state() const { return this->conn_state_; }
 
+  /** Voice phase for LED control (matches YAML substitution IDs) */
+  int get_voice_phase() const { return this->voice_phase_; }
+
  protected:
   // --- Configuration ---
   std::string server_url_;
@@ -97,6 +100,15 @@ class JarvisWsAudio : public Component {
   volatile bool audio_session_active_{false};
   volatile bool audio_session_requested_{false};
   uint32_t audio_session_start_ms_{0};
+
+  // --- Voice phase (for LED control, matches YAML substitution IDs) ---
+  static constexpr int PHASE_IDLE = 1;
+  static constexpr int PHASE_LISTENING = 3;
+  static constexpr int PHASE_THINKING = 4;
+  static constexpr int PHASE_REPLYING = 5;
+  static constexpr int PHASE_NOT_READY = 10;
+  static constexpr int PHASE_ERROR = 11;
+  volatile int voice_phase_{PHASE_NOT_READY};
 
   // --- Deferred flags (set by WS callbacks, processed in loop()) ---
   volatile bool trigger_listen_pending_{false};

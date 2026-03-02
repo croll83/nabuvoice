@@ -124,6 +124,7 @@ void JarvisWsAudio::loop() {
     this->conn_state_ = ConnState::AUDIO_STARTING;
     this->audio_session_active_ = true;
     this->audio_session_start_ms_ = now;
+    this->voice_phase_ = PHASE_LISTENING;
     this->send_json_("audio_start");
     ESP_LOGI(TAG, "Audio session requested, sent audio_start");
   }
@@ -137,6 +138,7 @@ void JarvisWsAudio::loop() {
       ESP_LOGW(TAG, "Audio session timeout");
       this->audio_session_active_ = false;
       this->conn_state_ = ConnState::CONNECTED;
+      this->voice_phase_ = PHASE_ERROR;
       this->microphone_->stop();
     }
   }
@@ -176,9 +178,8 @@ void JarvisWsAudio::handle_deferred_flags_() {
     this->trigger_listen_pending_ = false;
     bool silent = this->trigger_listen_silent_;
     ESP_LOGI(TAG, "Processing trigger_listen (silent=%d)", silent);
-    // TODO: fire trigger callback / automation
-    // If not silent: play wake sound, suppress speakers
-    // Then start audio session
+    // Multi-turn: server wants us to listen again
+    // LED will transition to LISTENING via start_session → voice_phase_
     this->start_session();
   }
 
@@ -186,37 +187,37 @@ void JarvisWsAudio::handle_deferred_flags_() {
   if (this->tts_done_pending_) {
     this->tts_done_pending_ = false;
     ESP_LOGI(TAG, "TTS done — returning to idle");
+    this->voice_phase_ = PHASE_IDLE;
     this->send_state("idle");
-    // TODO: fire tts_done automation trigger
   }
 
   // wake_detected from server (server-side wake word)
   if (this->wake_detected_pending_) {
     this->wake_detected_pending_ = false;
     ESP_LOGI(TAG, "Server wake_detected — starting session");
-    // TODO: play wake sound, suppress speakers
+    // LED will transition to LISTENING via start_session → voice_phase_
     this->start_session();
   }
 
-  // config_update from server
+  // config_update from server (sensitivity, etc.)
   if (this->config_update_pending_) {
     this->config_update_pending_ = false;
     float sensitivity = this->config_new_sensitivity_;
-    ESP_LOGI(TAG, "Config update: sensitivity=%.2f", sensitivity);
-    // TODO: update micro_wake_word sensitivity if available
+    ESP_LOGI(TAG, "Config update: sensitivity=%.2f (logged only, MWW sensitivity set via YAML)", sensitivity);
   }
 
-  // Audio session done (set by streaming loop completion)
+  // Audio session done (set by speech_end or error)
   if (this->session_done_pending_) {
     this->session_done_pending_ = false;
     bool success = this->session_done_success_;
     ESP_LOGI(TAG, "Audio session done (success=%d)", success);
     if (success) {
+      this->voice_phase_ = PHASE_THINKING;
       this->send_state("busy");
     } else {
+      this->voice_phase_ = PHASE_ERROR;
       this->send_state("error");
     }
-    // TODO: fire session_done automation trigger
   }
 }
 
@@ -347,6 +348,7 @@ void JarvisWsAudio::disconnect_ws_() {
     this->audio_session_active_ = false;
     this->microphone_->stop();
   }
+  this->voice_phase_ = PHASE_NOT_READY;
   if (this->ws_client_) {
     esp_websocket_client_stop(this->ws_client_);
     esp_websocket_client_destroy(this->ws_client_);
@@ -371,6 +373,7 @@ void JarvisWsAudio::on_ws_event_(int32_t event_id, esp_websocket_event_data_t *d
     case WEBSOCKET_EVENT_CONNECTED:
       ESP_LOGI(TAG, "WebSocket connected");
       this->conn_state_ = ConnState::CONNECTED;
+      this->voice_phase_ = PHASE_IDLE;
       this->reconnect_delay_ms_ = RECONNECT_MIN_MS;
       this->last_ping_ms_ = millis();
       // Send hello
@@ -390,6 +393,7 @@ void JarvisWsAudio::on_ws_event_(int32_t event_id, esp_websocket_event_data_t *d
     case WEBSOCKET_EVENT_DISCONNECTED:
       ESP_LOGW(TAG, "WebSocket disconnected");
       this->conn_state_ = ConnState::DISCONNECTED;
+      this->voice_phase_ = PHASE_NOT_READY;
       this->audio_session_active_ = false;
       this->mic_stop_pending_ = true;  // defer mic stop to main loop
       break;
@@ -397,6 +401,7 @@ void JarvisWsAudio::on_ws_event_(int32_t event_id, esp_websocket_event_data_t *d
     case WEBSOCKET_EVENT_ERROR:
       ESP_LOGE(TAG, "WebSocket error");
       this->conn_state_ = ConnState::DISCONNECTED;
+      this->voice_phase_ = PHASE_NOT_READY;
       this->audio_session_active_ = false;
       this->mic_stop_pending_ = true;  // defer mic stop to main loop
       break;
@@ -434,6 +439,7 @@ void JarvisWsAudio::on_ws_text_message_(const char *data, int len) {
     if (this->conn_state_ == ConnState::STREAMING) {
       this->audio_session_active_ = false;
       this->conn_state_ = ConnState::CONNECTED;
+      this->voice_phase_ = PHASE_THINKING;
       this->microphone_->stop();
       this->session_done_pending_ = true;
       this->session_done_success_ = true;
@@ -443,6 +449,10 @@ void JarvisWsAudio::on_ws_text_message_(const char *data, int len) {
     cJSON *silent_obj = cJSON_GetObjectItem(msg, "silent");
     this->trigger_listen_silent_ = silent_obj ? cJSON_IsTrue(silent_obj) : true;
     this->trigger_listen_pending_ = true;
+
+  } else if (strcmp(type, "tts_start") == 0) {
+    ESP_LOGI(TAG, "TTS started (replying)");
+    this->voice_phase_ = PHASE_REPLYING;
 
   } else if (strcmp(type, "tts_done") == 0) {
     this->tts_done_pending_ = true;
@@ -465,6 +475,7 @@ void JarvisWsAudio::on_ws_text_message_(const char *data, int len) {
     if (this->audio_session_active_) {
       this->audio_session_active_ = false;
       this->conn_state_ = ConnState::CONNECTED;
+      this->voice_phase_ = PHASE_ERROR;
       this->microphone_->stop();
       this->session_done_pending_ = true;
       this->session_done_success_ = false;
@@ -546,6 +557,7 @@ void JarvisWsAudio::stop_session() {
     this->send_json_("audio_end");
     this->audio_session_active_ = false;
     this->conn_state_ = ConnState::CONNECTED;
+    this->voice_phase_ = PHASE_IDLE;
     this->microphone_->stop();
   }
 }

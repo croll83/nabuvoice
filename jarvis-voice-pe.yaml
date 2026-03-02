@@ -1526,15 +1526,9 @@ interval:
   - interval: 500ms
     then:
       - lambda: |-
-          // Determina la fase corrente basandosi sullo stato del componente
-          int new_phase;
-          if (!id(jarvis_audio).is_connected()) {
-            new_phase = ${voice_assist_not_ready_phase_id};
-          } else if (id(jarvis_audio).is_streaming()) {
-            new_phase = ${voice_assist_listening_for_command_phase_id};
-          } else {
-            new_phase = ${voice_assist_idle_phase_id};
-          }
+          // Il componente C++ traccia la fase completa:
+          // IDLE(1), LISTENING(3), THINKING(4), REPLYING(5), NOT_READY(10), ERROR(11)
+          int new_phase = id(jarvis_audio).get_voice_phase();
 
           // Rispetta l'override manuale (da wake word o button press)
           // per evitare flickering durante la transizione
