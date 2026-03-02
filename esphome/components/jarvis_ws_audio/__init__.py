@@ -22,7 +22,7 @@ import esphome.config_validation as cv
 from esphome import automation
 from esphome.const import CONF_ID, CONF_MICROPHONE
 from esphome.components import microphone
-from esphome.components.esp32 import include_builtin_idf_component
+from esphome.components.esp32 import add_idf_component
 
 DEPENDENCIES = ["network", "microphone"]
 AUTO_LOAD = ["microphone"]
@@ -69,8 +69,13 @@ async def to_code(config):
     else:
         cg.add(var.set_server_wakeword_mode(False))
 
-    # Add required ESP-IDF components
-    include_builtin_idf_component("esp_websocket_client")
+    # Add required ESP-IDF components (moved to esp-protocols repo in IDF 5.x)
+    add_idf_component(
+        name="esp_websocket_client",
+        repo="https://github.com/espressif/esp-protocols.git",
+        path="components/esp_websocket_client",
+        ref="websocket_client-v1.2.3",
+    )
     # Opus: needs to be provided as a static library or built from source
     # TODO: determine best way to bundle libopus for ESP-IDF in ESPHome context
     cg.add_build_flag("-DUSE_JARVIS_WS_AUDIO")
