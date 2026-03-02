@@ -107,6 +107,7 @@ class JarvisWsAudio : public Component {
   volatile float config_new_sensitivity_{0.82f};
   volatile bool session_done_pending_{false};
   volatile bool session_done_success_{false};
+  volatile bool mic_stop_pending_{false};  // deferred mic stop from WS task context
 
   // --- Opus encoder ---
   OpusEncoder *opus_encoder_{nullptr};
@@ -119,9 +120,10 @@ class JarvisWsAudio : public Component {
   uint32_t last_ping_ms_{0};
 
   // --- Audio buffer for microphone data ---
-  // ESPHome microphone provides data via callback; we accumulate here
-  std::vector<int16_t> mic_buffer_;
-  size_t mic_buffer_write_pos_{0};
+  // ESPHome microphone provides data via callback (uint8_t); we accumulate here
+  std::vector<uint8_t> mic_buffer_;
+  volatile size_t mic_buffer_write_pos_{0};
+  size_t mic_buffer_read_pos_{0};
 
   // --- Internal methods ---
   bool init_opus_encoder_();

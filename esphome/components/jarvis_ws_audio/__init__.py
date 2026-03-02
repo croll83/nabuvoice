@@ -74,10 +74,14 @@ async def to_code(config):
         name="esp_websocket_client",
         repo="https://github.com/espressif/esp-protocols.git",
         path="components/esp_websocket_client",
-        ref="websocket_client-v1.2.3",
+        ref="websocket-v1.6.1",
     )
-    # Opus: needs to be provided as a static library or built from source
-    # TODO: determine best way to bundle libopus for ESP-IDF in ESPHome context
+    # Opus codec library (same as AtomS3R project)
+    add_idf_component(
+        name="esp-libopus",
+        repo="https://github.com/espressif/esp-libopus.git",
+        ref="v1.3.1",
+    )
     cg.add_build_flag("-DUSE_JARVIS_WS_AUDIO")
 
 

@@ -72,21 +72,21 @@ void JarvisWsAudio::setup() {
     return;
   }
 
-  // Allocate mic buffer (enough for continuous streaming)
-  // Ring buffer: 2 seconds @ 16kHz = 32000 samples
-  this->mic_buffer_.resize(32000, 0);
+  // Allocate mic buffer (ring buffer for raw bytes from ESPHome microphone)
+  // 2 seconds @ 16kHz, 16-bit mono = 64000 bytes
+  this->mic_buffer_.resize(64000, 0);
   this->mic_buffer_write_pos_ = 0;
+  this->mic_buffer_read_pos_ = 0;
 
   // Register microphone data callback
-  // TODO: verify ESPHome microphone API for data callback registration
-  // The microphone component may need to be started explicitly
-  // this->microphone_->add_data_callback([this](const std::vector<int16_t> &data) {
-  //   // Copy audio data to our ring buffer
-  //   for (auto sample : data) {
-  //     this->mic_buffer_[this->mic_buffer_write_pos_ % this->mic_buffer_.size()] = sample;
-  //     this->mic_buffer_write_pos_++;
-  //   }
-  // });
+  // ESPHome microphone delivers audio as std::vector<uint8_t> chunks (~16ms each)
+  this->microphone_->add_data_callback([this](const std::vector<uint8_t> &data) {
+    size_t buf_size = this->mic_buffer_.size();
+    for (size_t i = 0; i < data.size(); i++) {
+      this->mic_buffer_[this->mic_buffer_write_pos_ % buf_size] = data[i];
+      this->mic_buffer_write_pos_++;
+    }
+  });
 
   ESP_LOGI(TAG, "JARVIS WS Audio initialized (mode=%s)",
            this->server_wakeword_mode_ ? "server" : "local");
@@ -137,6 +137,7 @@ void JarvisWsAudio::loop() {
       ESP_LOGW(TAG, "Audio session timeout");
       this->audio_session_active_ = false;
       this->conn_state_ = ConnState::CONNECTED;
+      this->microphone_->stop();
     }
   }
 
@@ -164,6 +165,12 @@ void JarvisWsAudio::loop() {
 // =============================================================================
 
 void JarvisWsAudio::handle_deferred_flags_() {
+  // Deferred mic stop (set from WS task context, processed here in main loop)
+  if (this->mic_stop_pending_) {
+    this->mic_stop_pending_ = false;
+    this->microphone_->stop();
+  }
+
   // trigger_listen from server (multi-turn or enrollment)
   if (this->trigger_listen_pending_) {
     this->trigger_listen_pending_ = false;
@@ -221,30 +228,34 @@ void JarvisWsAudio::process_audio_session_() {
   if (!this->opus_encoder_ || !this->enc_input_buffer_ || !this->enc_output_buffer_)
     return;
 
-  // TODO: Read OPUS_FRAME_SAMPLES (320) samples from microphone ring buffer
-  // For now this is a placeholder — exact microphone API integration
-  // depends on ESPHome microphone component's data delivery mechanism.
-  //
-  // The AtomS3R reads from a ring buffer filled by a separate I2S task:
-  //   size_t samples = jarvis_audio_read_raw(enc_input_buffer, OPUS_FRAME_SAMPLES, 15);
-  //
-  // In ESPHome, the microphone component delivers data via callback.
-  // We need to accumulate samples in mic_buffer_ and read from there.
-  //
-  // Example:
-  //   size_t available = mic_buffer_write_pos_ - mic_buffer_read_pos_;
-  //   if (available < OPUS_FRAME_SAMPLES) return;  // Not enough data yet
-  //   memcpy(enc_input_buffer_, &mic_buffer_[read_pos % size], OPUS_FRAME_SAMPLES * 2);
-  //   mic_buffer_read_pos_ += OPUS_FRAME_SAMPLES;
+  // Each Opus frame = 320 samples * 2 bytes = 640 bytes
+  const size_t frame_bytes = OPUS_FRAME_SAMPLES * sizeof(int16_t);
+  const size_t buf_size = this->mic_buffer_.size();
 
-  // Encode to Opus
-  // int encoded_size = opus_encode(opus_encoder_, enc_input_buffer_,
-  //                                OPUS_FRAME_SAMPLES, enc_output_buffer_,
-  //                                OPUS_MAX_PACKET_SIZE);
-  // if (encoded_size > 0) {
-  //   esp_websocket_client_send_bin(ws_client_, (const char *)enc_output_buffer_,
-  //                                 encoded_size, pdMS_TO_TICKS(1000));
-  // }
+  // Process all available complete frames
+  while (true) {
+    size_t available = this->mic_buffer_write_pos_ - this->mic_buffer_read_pos_;
+    if (available < frame_bytes)
+      break;
+
+    // Copy bytes from ring buffer → int16_t input buffer (little-endian)
+    for (int i = 0; i < OPUS_FRAME_SAMPLES; i++) {
+      size_t byte_pos = (this->mic_buffer_read_pos_ + i * 2) % buf_size;
+      uint8_t lo = this->mic_buffer_[byte_pos];
+      uint8_t hi = this->mic_buffer_[(byte_pos + 1) % buf_size];
+      this->enc_input_buffer_[i] = (int16_t)((hi << 8) | lo);
+    }
+    this->mic_buffer_read_pos_ += frame_bytes;
+
+    // Encode to Opus
+    int encoded_size = opus_encode(this->opus_encoder_, this->enc_input_buffer_,
+                                   OPUS_FRAME_SAMPLES, this->enc_output_buffer_,
+                                   OPUS_MAX_PACKET_SIZE);
+    if (encoded_size > 0) {
+      esp_websocket_client_send_bin(this->ws_client_, (const char *)this->enc_output_buffer_,
+                                    encoded_size, pdMS_TO_TICKS(100));
+    }
+  }
 }
 
 // =============================================================================
@@ -332,7 +343,10 @@ bool JarvisWsAudio::connect_ws_() {
 }
 
 void JarvisWsAudio::disconnect_ws_() {
-  this->audio_session_active_ = false;
+  if (this->audio_session_active_) {
+    this->audio_session_active_ = false;
+    this->microphone_->stop();
+  }
   if (this->ws_client_) {
     esp_websocket_client_stop(this->ws_client_);
     esp_websocket_client_destroy(this->ws_client_);
@@ -377,12 +391,14 @@ void JarvisWsAudio::on_ws_event_(int32_t event_id, esp_websocket_event_data_t *d
       ESP_LOGW(TAG, "WebSocket disconnected");
       this->conn_state_ = ConnState::DISCONNECTED;
       this->audio_session_active_ = false;
+      this->mic_stop_pending_ = true;  // defer mic stop to main loop
       break;
 
     case WEBSOCKET_EVENT_ERROR:
       ESP_LOGE(TAG, "WebSocket error");
       this->conn_state_ = ConnState::DISCONNECTED;
       this->audio_session_active_ = false;
+      this->mic_stop_pending_ = true;  // defer mic stop to main loop
       break;
 
     default:
@@ -418,6 +434,7 @@ void JarvisWsAudio::on_ws_text_message_(const char *data, int len) {
     if (this->conn_state_ == ConnState::STREAMING) {
       this->audio_session_active_ = false;
       this->conn_state_ = ConnState::CONNECTED;
+      this->microphone_->stop();
       this->session_done_pending_ = true;
       this->session_done_success_ = true;
     }
@@ -448,6 +465,7 @@ void JarvisWsAudio::on_ws_text_message_(const char *data, int len) {
     if (this->audio_session_active_) {
       this->audio_session_active_ = false;
       this->conn_state_ = ConnState::CONNECTED;
+      this->microphone_->stop();
       this->session_done_pending_ = true;
       this->session_done_success_ = false;
     }
@@ -515,6 +533,10 @@ void JarvisWsAudio::start_session() {
     ESP_LOGW(TAG, "Audio session already active");
     return;
   }
+  // Reset ring buffer for fresh audio
+  this->mic_buffer_read_pos_ = this->mic_buffer_write_pos_;
+  // Start microphone capture
+  this->microphone_->start();
   this->audio_session_requested_ = true;
 }
 
@@ -524,6 +546,7 @@ void JarvisWsAudio::stop_session() {
     this->send_json_("audio_end");
     this->audio_session_active_ = false;
     this->conn_state_ = ConnState::CONNECTED;
+    this->microphone_->stop();
   }
 }
 
