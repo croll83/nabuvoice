@@ -1,0 +1,15 @@
+# Secrets (contiene WiFi password, token, ecc.)
+secrets.yaml
+
+# ESPHome build artifacts
+.esphome/
+.pioenvs/
+.piolibdeps/
+
+# IDE
+.vscode/
+.idea/
+
+# OS
+.DS_Store
+Thumbs.db
