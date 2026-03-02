@@ -150,7 +150,8 @@ void JarvisWsAudio::loop() {
       this->audio_session_active_ = false;
       this->conn_state_ = ConnState::CONNECTED;
       this->voice_phase_ = PHASE_ERROR;
-      this->microphone_->stop();
+      // Note: do NOT call microphone_->stop() here — MWW manages the mic lifecycle.
+      // Stopping it would kill wake word detection.
     }
   }
 
@@ -196,10 +197,9 @@ void JarvisWsAudio::loop() {
 // =============================================================================
 
 void JarvisWsAudio::handle_deferred_flags_() {
-  // Deferred mic stop (set from WS task context, processed here in main loop)
+  // Deferred mic stop flag (cleared but no longer stops mic — MWW manages lifecycle)
   if (this->mic_stop_pending_) {
     this->mic_stop_pending_ = false;
-    this->microphone_->stop();
   }
 
   // trigger_listen from server (multi-turn or enrollment)
@@ -374,10 +374,7 @@ bool JarvisWsAudio::connect_ws_() {
 }
 
 void JarvisWsAudio::disconnect_ws_() {
-  if (this->audio_session_active_) {
-    this->audio_session_active_ = false;
-    this->microphone_->stop();
-  }
+  this->audio_session_active_ = false;
   this->voice_phase_ = PHASE_NOT_READY;
   if (this->ws_client_) {
     esp_websocket_client_stop(this->ws_client_);
@@ -480,7 +477,6 @@ void JarvisWsAudio::on_ws_text_message_(const char *data, int len) {
       this->audio_session_active_ = false;
       this->conn_state_ = ConnState::CONNECTED;
       this->voice_phase_ = PHASE_THINKING;
-      this->microphone_->stop();
       this->session_done_pending_ = true;
       this->session_done_success_ = true;
     }
@@ -516,7 +512,6 @@ void JarvisWsAudio::on_ws_text_message_(const char *data, int len) {
       this->audio_session_active_ = false;
       this->conn_state_ = ConnState::CONNECTED;
       this->voice_phase_ = PHASE_ERROR;
-      this->microphone_->stop();
       this->session_done_pending_ = true;
       this->session_done_success_ = false;
     }
@@ -584,10 +579,8 @@ void JarvisWsAudio::start_session() {
     ESP_LOGW(TAG, "Audio session already active");
     return;
   }
-  // Reset ring buffer for fresh audio
+  // Reset ring buffer for fresh audio (mic is already running via MWW)
   this->mic_buffer_read_pos_ = this->mic_buffer_write_pos_;
-  // Start microphone capture
-  this->microphone_->start();
   this->audio_session_requested_ = true;
 }
 
@@ -598,7 +591,6 @@ void JarvisWsAudio::stop_session() {
     this->audio_session_active_ = false;
     this->conn_state_ = ConnState::CONNECTED;
     this->voice_phase_ = PHASE_IDLE;
-    this->microphone_->stop();
   }
 }
 
@@ -613,6 +605,9 @@ void JarvisWsAudio::send_dnd(bool enabled) {
 }
 
 void JarvisWsAudio::send_volume_change(const std::string &direction) {
+  uint32_t now = millis();
+  if (now - this->last_volume_change_ms_ < 200) return;  // Throttle: max 5 per second
+  this->last_volume_change_ms_ = now;
   ESP_LOGI(TAG, "Sending volume_change: %s", direction.c_str());
   this->send_json_("volume_change", "direction", direction.c_str());
 }

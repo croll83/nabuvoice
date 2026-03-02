@@ -90,6 +90,7 @@ esp32:
       CONFIG_BT_BLE_DYNAMIC_ENV_MEMORY: "y"
       CONFIG_MBEDTLS_EXTERNAL_MEM_ALLOC: "y"
       CONFIG_MBEDTLS_SSL_PROTO_TLS1_3: "y"
+      CONFIG_ESP_MAIN_TASK_STACK_SIZE: "24576"
 
 wifi:
   id: wifi_id
@@ -1187,15 +1188,25 @@ micro_wake_word:
       internal: true
   vad:
   on_wake_word_detected:
+    - logger.log:
+        level: INFO
+        format: "Wake word trigger: '%s', mute=%d"
+        args: ['wake_word.c_str()', '(int)id(master_mute_switch).state']
     - if:
         condition:
           switch.is_off: master_mute_switch
         then:
-          # "hey jarvis" → avvia sessione audio
+          # Check for "stop" (case-insensitive)
           - if:
               condition:
-                lambda: 'return wake_word == "hey_jarvis";'
+                lambda: |-
+                  std::string ww = wake_word;
+                  for (auto &c : ww) c = tolower(c);
+                  return ww.find("stop") != std::string::npos;
               then:
+                - jarvis_ws_audio.speaker_stop: jarvis_audio
+              else:
+                # Any other wake word (hey_jarvis) → start session
                 - if:
                     condition:
                       switch.is_on: wake_sound
@@ -1210,12 +1221,6 @@ micro_wake_word:
                     id(voice_assistant_phase) = ${voice_assist_listening_for_command_phase_id};
                     id(phase_override_until) = millis() + 3000;
                 - script.execute: control_leds
-          # "stop" → ferma speaker (Echo/Alexa)
-          - if:
-              condition:
-                lambda: 'return wake_word == "stop";'
-              then:
-                - jarvis_ws_audio.speaker_stop: jarvis_audio
 
 # =============================================================================
 # SCRIPTS

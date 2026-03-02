@@ -131,6 +131,7 @@ class JarvisWsAudio : public Component {
   uint32_t last_reconnect_attempt_ms_{0};
   uint32_t last_ping_ms_{0};
   uint32_t last_data_ms_{0};  // last time we received any WS data (for watchdog)
+  uint32_t last_volume_change_ms_{0};  // throttle volume_change messages
 
   // --- Audio buffer for microphone data ---
   // ESPHome microphone provides data via callback (uint8_t); we accumulate here
