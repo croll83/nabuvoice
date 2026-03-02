@@ -1181,39 +1181,41 @@ micro_wake_word:
   models:
     - model: hey_jarvis
       id: hey_jarvis
-      on_wake_word_detected:
-        - if:
-            condition:
-              switch.is_off: master_mute_switch
-            then:
-              # Suona beep se abilitato
-              - if:
-                  condition:
-                    switch.is_on: wake_sound
-                  then:
-                    - script.execute:
-                        id: play_sound
-                        priority: true
-                        sound_file: "wake_word_triggered_sound"
-                    - delay: 300ms
-              # Avvia sessione audio via WebSocket
-              - jarvis_ws_audio.start_session: jarvis_audio
-              # LED: stato listening
-              - lambda: |-
-                  id(voice_assistant_phase) = ${voice_assist_listening_for_command_phase_id};
-                  id(phase_override_until) = millis() + 3000;
-              - script.execute: control_leds
     # Stop word: per interrompere risposte lunghe
     - model: https://github.com/kahrendt/microWakeWord/releases/download/stop/stop.json
       id: stop
       internal: true
-      on_wake_word_detected:
-        - if:
-            condition:
-              switch.is_off: master_mute_switch
-            then:
-              - jarvis_ws_audio.speaker_stop: jarvis_audio
   vad:
+  on_wake_word_detected:
+    - if:
+        condition:
+          switch.is_off: master_mute_switch
+        then:
+          # "hey jarvis" → avvia sessione audio
+          - if:
+              condition:
+                lambda: 'return wake_word == "hey_jarvis";'
+              then:
+                - if:
+                    condition:
+                      switch.is_on: wake_sound
+                    then:
+                      - script.execute:
+                          id: play_sound
+                          priority: true
+                          sound_file: "wake_word_triggered_sound"
+                      - delay: 300ms
+                - jarvis_ws_audio.start_session: jarvis_audio
+                - lambda: |-
+                    id(voice_assistant_phase) = ${voice_assist_listening_for_command_phase_id};
+                    id(phase_override_until) = millis() + 3000;
+                - script.execute: control_leds
+          # "stop" → ferma speaker (Echo/Alexa)
+          - if:
+              condition:
+                lambda: 'return wake_word == "stop";'
+              then:
+                - jarvis_ws_audio.speaker_stop: jarvis_audio
 
 # =============================================================================
 # SCRIPTS
