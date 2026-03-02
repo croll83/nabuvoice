@@ -306,6 +306,13 @@ void JarvisWsAudio::build_ws_url_(char *buf, size_t buf_size) {
 }
 
 bool JarvisWsAudio::connect_ws_() {
+  // Clean up any existing client before creating a new one
+  if (this->ws_client_) {
+    esp_websocket_client_stop(this->ws_client_);
+    esp_websocket_client_destroy(this->ws_client_);
+    this->ws_client_ = nullptr;
+  }
+
   char url[384];
   this->build_ws_url_(url, sizeof(url));
   ESP_LOGI(TAG, "Connecting to %s", url);
@@ -315,8 +322,9 @@ bool JarvisWsAudio::connect_ws_() {
   esp_websocket_client_config_t ws_cfg = {};
   ws_cfg.uri = url;
   ws_cfg.buffer_size = 2048;
-  ws_cfg.task_stack = 4096;
+  ws_cfg.task_stack = 6144;
   ws_cfg.task_prio = 5;
+  ws_cfg.disable_auto_reconnect = true;  // We handle reconnection ourselves
 
   this->ws_client_ = esp_websocket_client_init(&ws_cfg);
   if (!this->ws_client_) {
