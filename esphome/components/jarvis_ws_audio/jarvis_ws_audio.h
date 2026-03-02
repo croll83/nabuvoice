@@ -151,7 +151,7 @@ template<typename... Ts>
 class StartSessionAction : public Action<Ts...> {
  public:
   explicit StartSessionAction(JarvisWsAudio *parent) : parent_(parent) {}
-  void play(Ts... x) override { this->parent_->start_session(); }
+  void play(const Ts &...x) override { this->parent_->start_session(); }
  protected:
   JarvisWsAudio *parent_;
 };
@@ -160,7 +160,7 @@ template<typename... Ts>
 class StopSessionAction : public Action<Ts...> {
  public:
   explicit StopSessionAction(JarvisWsAudio *parent) : parent_(parent) {}
-  void play(Ts... x) override { this->parent_->stop_session(); }
+  void play(const Ts &...x) override { this->parent_->stop_session(); }
  protected:
   JarvisWsAudio *parent_;
 };
@@ -169,7 +169,7 @@ template<typename... Ts>
 class SendSpeakerStopAction : public Action<Ts...> {
  public:
   explicit SendSpeakerStopAction(JarvisWsAudio *parent) : parent_(parent) {}
-  void play(Ts... x) override { this->parent_->send_speaker_stop(); }
+  void play(const Ts &...x) override { this->parent_->send_speaker_stop(); }
  protected:
   JarvisWsAudio *parent_;
 };
@@ -179,7 +179,7 @@ class SendDndAction : public Action<Ts...> {
  public:
   explicit SendDndAction(JarvisWsAudio *parent) : parent_(parent) {}
   TEMPLATABLE_VALUE(bool, enabled)
-  void play(Ts... x) override { this->parent_->send_dnd(this->enabled_.value(x...)); }
+  void play(const Ts &...x) override { this->parent_->send_dnd(this->enabled_.value(x...)); }
  protected:
   JarvisWsAudio *parent_;
 };
@@ -189,7 +189,7 @@ class SendVolumeChangeAction : public Action<Ts...> {
  public:
   explicit SendVolumeChangeAction(JarvisWsAudio *parent) : parent_(parent) {}
   TEMPLATABLE_VALUE(std::string, direction)
-  void play(Ts... x) override { this->parent_->send_volume_change(this->direction_.value(x...)); }
+  void play(const Ts &...x) override { this->parent_->send_volume_change(this->direction_.value(x...)); }
  protected:
   JarvisWsAudio *parent_;
 };
