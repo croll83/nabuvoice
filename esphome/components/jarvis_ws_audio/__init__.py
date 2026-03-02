@@ -76,11 +76,11 @@ async def to_code(config):
         path="components/esp_websocket_client",
         ref="websocket-v1.6.1",
     )
-    # Opus codec library (same as AtomS3R project)
+    # Opus codec library (78/esp-opus — ESP Component Registry v1.0.5)
     add_idf_component(
-        name="esp-libopus",
-        repo="https://github.com/espressif/esp-libopus.git",
-        ref="v1.3.1",
+        name="esp-opus",
+        repo="https://github.com/78/esp-opus.git",
+        ref="5854a9f7de06ab3505b8fe6e8943db581c2cbe70",
     )
     cg.add_build_flag("-DUSE_JARVIS_WS_AUDIO")
 
