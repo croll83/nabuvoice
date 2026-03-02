@@ -76,12 +76,8 @@ async def to_code(config):
         path="components/esp_websocket_client",
         ref="websocket-v1.6.1",
     )
-    # Opus codec library (78/esp-opus — ESP Component Registry v1.0.5)
-    add_idf_component(
-        name="esp-opus",
-        repo="https://github.com/78/esp-opus.git",
-        ref="5854a9f7de06ab3505b8fe6e8943db581c2cbe70",
-    )
+    # Opus codec library (same as ESPHome's audio component — full encoder+decoder)
+    add_idf_component(name="esphome/micro-opus", ref="0.3.4")
     cg.add_build_flag("-DUSE_JARVIS_WS_AUDIO")
 
 
