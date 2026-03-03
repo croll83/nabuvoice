@@ -6,7 +6,7 @@
  * Port of AtomS3R jarvis_ws_audio to ESPHome component framework.
  *
  * Persistent WebSocket connection to JARVIS wakeword server / orchestrator.
- * Handles audio streaming (Opus) and control channel (JSON) on a single WS.
+ * Handles audio streaming (raw PCM) and control channel (JSON) on a single WS.
  *
  * Protocol: identical to AtomS3R (see jarvis_ws_audio.c), plus:
  *   - {"type": "volume_change", "direction": "up|down"} (new, for rotary encoder)
@@ -132,10 +132,8 @@ class JarvisWsAudio : public Component {
   volatile bool session_done_success_{false};
   volatile bool mic_stop_pending_{false};  // deferred mic stop from WS task context
 
-  // --- Opus encoder ---
-  OpusEncoder *opus_encoder_{nullptr};
-  int16_t *enc_input_buffer_{nullptr};
-  uint8_t *enc_output_buffer_{nullptr};
+  // --- PCM send buffer (raw 16-bit mono frames) ---
+  uint8_t *pcm_send_buffer_{nullptr};   // 640 bytes = 320 samples × 2 bytes (one 20ms frame)
 
   // --- Opus decoder (TTS playback) ---
   OpusDecoder *opus_decoder_{nullptr};
@@ -170,7 +168,7 @@ class JarvisWsAudio : public Component {
 
   // --- Audio buffer for microphone data ---
   // Mic callback extracts left channel (16-bit mono) from 32-bit stereo and stores here.
-  // Ring buffer holds clean 16-bit mono samples ready for Opus encoding.
+  // Ring buffer holds clean 16-bit mono samples ready for PCM send.
   // Allocated from PSRAM to avoid exhausting internal SRAM.
   uint8_t *mic_buffer_{nullptr};
   size_t mic_buffer_size_{0};          // 32000 bytes = 1 second of 16-bit mono @ 16kHz
@@ -184,7 +182,7 @@ class JarvisWsAudio : public Component {
   volatile bool debug_first_frame_{true};  // Log first audio frame of each session
 
   // --- Internal methods ---
-  bool init_opus_encoder_();
+  bool init_pcm_send_buffer_();
   bool init_opus_decoder_();
   void build_ws_url_(char *buf, size_t buf_size);
   bool connect_ws_();

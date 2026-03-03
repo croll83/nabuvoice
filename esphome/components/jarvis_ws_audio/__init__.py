@@ -83,9 +83,11 @@ async def to_code(config):
         path="components/esp_websocket_client",
         ref="websocket-v1.6.1",
     )
-    # Opus codec library (same as ESPHome's audio component — full encoder+decoder)
+    # Opus codec library (decoder only — used for TTS playback)
     add_idf_component(name="esphome/micro-opus", ref="0.3.4")
     cg.add_build_flag("-DUSE_JARVIS_WS_AUDIO")
+    # Force fixed-point SILK path — float (FLP) path crashes on ESP32
+    cg.add_build_flag("-DFIXED_POINT=1")
 
 
 # --- Automation Actions ---

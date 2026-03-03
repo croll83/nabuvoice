@@ -13,7 +13,7 @@
  *   - New message: volume_change for rotary encoder
  *
  * Identical to AtomS3R:
- *   - Opus encoding (same codec, same params)
+ *   - WebSocket binary audio (raw PCM instead of Opus)
  *   - esp_websocket_client (same ESP-IDF library)
  *   - WebSocket protocol (all message types)
  *   - Connection state machine
@@ -38,10 +38,9 @@ static const char *const TAG = "jarvis_ws_audio";
 
 // --- Audio constants ---
 static constexpr int SAMPLE_RATE = 16000;
-static constexpr int OPUS_FRAME_SAMPLES = 320;       // 20ms @ 16kHz
-static constexpr int OPUS_MAX_PACKET_SIZE = 1276;
-static constexpr int OPUS_BITRATE_VAL = 48000;        // 48kbps (was 30k — more headroom for speech quality)
-static constexpr int OPUS_COMPLEXITY_VAL = 5;          // Moderate complexity (was 0 — ESP32-S3 can handle it)
+static constexpr int PCM_FRAME_SAMPLES = 320;          // 20ms @ 16kHz (same as stock firmware)
+static constexpr int PCM_FRAME_BYTES = PCM_FRAME_SAMPLES * 2;  // 640 bytes per frame (16-bit mono)
+static constexpr int OPUS_FRAME_SAMPLES = 320;         // 20ms @ 16kHz (for TTS decoder)
 
 // --- Microphone format constants ---
 // Voice PE I2S mic: 32-bit stereo (bits_per_sample: 32bit, channel: stereo)
@@ -74,9 +73,9 @@ void JarvisWsAudio::setup() {
   this->device_id_ = std::string(mac_str);
   ESP_LOGI(TAG, "Device ID (MAC): %s", this->device_id_.c_str());
 
-  // Initialize Opus encoder + decoder
-  if (!this->init_opus_encoder_()) {
-    ESP_LOGE(TAG, "Opus encoder init failed");
+  // Initialize PCM send buffer + Opus decoder (for TTS playback)
+  if (!this->init_pcm_send_buffer_()) {
+    ESP_LOGE(TAG, "PCM send buffer init failed");
     this->mark_failed();
     return;
   }
@@ -121,8 +120,8 @@ void JarvisWsAudio::setup() {
     }
   });
 
-  // Create dedicated FreeRTOS task for Opus encoding.
-  // opus_encode → silk_Encode uses ~10KB+ stack, too much for ESPHome's loopTask.
+  // Create dedicated FreeRTOS task for audio processing.
+  // PCM send + TTS Opus decode run on separate task to avoid blocking ESPHome's loopTask.
   // Task stack is allocated from PSRAM to preserve internal RAM.
   this->audio_task_stack_ = (StackType_t *)heap_caps_malloc(
       32768, MALLOC_CAP_SPIRAM | MALLOC_CAP_8BIT);
@@ -133,7 +132,7 @@ void JarvisWsAudio::setup() {
   }
   this->audio_task_handle_ = xTaskCreateStaticPinnedToCore(
       &JarvisWsAudio::audio_encode_task_,
-      "jarvis_audio_enc",
+      "jarvis_audio",
       32768,    // 32KB stack
       this,
       5,        // Priority
@@ -193,8 +192,8 @@ void JarvisWsAudio::loop() {
     this->audio_session_active_ = true;
     this->audio_session_start_ms_ = now;
     this->voice_phase_ = PHASE_LISTENING;
-    this->send_json_("audio_start");
-    ESP_LOGI(TAG, "Audio session requested, sent audio_start");
+    this->send_json_("audio_start", "codec", "pcm");
+    ESP_LOGI(TAG, "Audio session requested, sent audio_start (codec=pcm)");
   }
 
   // --- Active audio session: signal encoding task ---
@@ -321,51 +320,56 @@ void JarvisWsAudio::handle_deferred_flags_() {
 // =============================================================================
 
 void JarvisWsAudio::process_audio_session_() {
-  if (!this->opus_encoder_ || !this->enc_input_buffer_ || !this->enc_output_buffer_)
+  if (!this->pcm_send_buffer_)
     return;
 
-  // Ring buffer now stores 16-bit mono samples (channel extraction done in callback)
-  // Each Opus frame = 320 samples × 2 bytes = 640 bytes
-  const size_t frame_bytes = OPUS_FRAME_SAMPLES * MIC_BYTES_PER_MONO_SAMPLE;
+  // Ring buffer stores 16-bit mono samples (channel extraction done in callback)
+  // Each PCM frame = 320 samples × 2 bytes = 640 bytes
   const size_t buf_size = this->mic_buffer_size_;
 
   // Process all available complete frames
+  int frames_sent = 0;
   while (true) {
     size_t available = this->mic_buffer_write_pos_ - this->mic_buffer_read_pos_;
-    if (available < frame_bytes)
+    if (available < PCM_FRAME_BYTES)
       break;
 
-    // Read 16-bit mono samples directly from ring buffer into Opus input buffer
-    int32_t peak = 0;
-    for (int i = 0; i < OPUS_FRAME_SAMPLES; i++) {
-      size_t pos = (this->mic_buffer_read_pos_ + i * MIC_BYTES_PER_MONO_SAMPLE) % buf_size;
-      uint8_t lo = this->mic_buffer_[pos];
-      uint8_t hi = this->mic_buffer_[(pos + 1) % buf_size];
-      int16_t sample = (int16_t)((hi << 8) | lo);
-      this->enc_input_buffer_[i] = sample;
-      // Track peak for debug logging
-      int32_t abs_val = sample < 0 ? -sample : sample;
-      if (abs_val > peak) peak = abs_val;
+    // Overflow detection: if more than buffer size is available, we've wrapped
+    if (available > buf_size) {
+      size_t lost = available - buf_size;
+      ESP_LOGW(TAG, "Ring buffer overflow! %u bytes lost, skipping to live audio", (unsigned)lost);
+      // Skip to near-live position (keep last ~100ms)
+      this->mic_buffer_read_pos_ = this->mic_buffer_write_pos_ - (buf_size / 4);
+      available = this->mic_buffer_write_pos_ - this->mic_buffer_read_pos_;
+      if (available < PCM_FRAME_BYTES)
+        break;
     }
-    this->mic_buffer_read_pos_ += frame_bytes;
+
+    // Copy 16-bit mono samples from ring buffer into send buffer
+    int32_t peak = 0;
+    for (size_t i = 0; i < PCM_FRAME_BYTES; i++) {
+      size_t pos = (this->mic_buffer_read_pos_ + i) % buf_size;
+      this->pcm_send_buffer_[i] = this->mic_buffer_[pos];
+    }
 
     // Debug: log first frame stats for diagnosis
     if (this->debug_first_frame_) {
       this->debug_first_frame_ = false;
-      ESP_LOGI(TAG, "First frame: peak=%ld, samples[0..3]=[%d,%d,%d,%d]",
-               (long)peak,
-               this->enc_input_buffer_[0], this->enc_input_buffer_[1],
-               this->enc_input_buffer_[2], this->enc_input_buffer_[3]);
+      const int16_t *samples = (const int16_t *)this->pcm_send_buffer_;
+      for (int i = 0; i < PCM_FRAME_SAMPLES; i++) {
+        int32_t abs_val = samples[i] < 0 ? -samples[i] : samples[i];
+        if (abs_val > peak) peak = abs_val;
+      }
+      ESP_LOGI(TAG, "First PCM frame: peak=%ld, samples[0..3]=[%d,%d,%d,%d]",
+               (long)peak, samples[0], samples[1], samples[2], samples[3]);
     }
 
-    // Encode to Opus
-    int encoded_size = opus_encode(this->opus_encoder_, this->enc_input_buffer_,
-                                   OPUS_FRAME_SAMPLES, this->enc_output_buffer_,
-                                   OPUS_MAX_PACKET_SIZE);
-    if (encoded_size > 0) {
-      esp_websocket_client_send_bin(this->ws_client_, (const char *)this->enc_output_buffer_,
-                                    encoded_size, pdMS_TO_TICKS(100));
-    }
+    this->mic_buffer_read_pos_ += PCM_FRAME_BYTES;
+
+    // Send raw PCM frame directly over WebSocket (no encoding)
+    esp_websocket_client_send_bin(this->ws_client_, (const char *)this->pcm_send_buffer_,
+                                  PCM_FRAME_BYTES, pdMS_TO_TICKS(100));
+    frames_sent++;
   }
 }
 
@@ -375,7 +379,7 @@ void JarvisWsAudio::process_audio_session_() {
 
 void JarvisWsAudio::audio_encode_task_(void *param) {
   JarvisWsAudio *self = static_cast<JarvisWsAudio *>(param);
-  ESP_LOGI(TAG, "Audio encode task started");
+  ESP_LOGI(TAG, "Audio task started (PCM send + TTS decode)");
   while (true) {
     // Wait for notification from loop(), or poll every 20ms
     ulTaskNotifyTake(pdTRUE, pdMS_TO_TICKS(20));
@@ -447,33 +451,20 @@ void JarvisWsAudio::process_tts_playback_() {
 }
 
 // =============================================================================
-// OPUS INITIALIZATION (identical to AtomS3R)
+// PCM SEND BUFFER INITIALIZATION
 // =============================================================================
 
-bool JarvisWsAudio::init_opus_encoder_() {
-  int err;
-  this->opus_encoder_ = opus_encoder_create(SAMPLE_RATE, 1, OPUS_APPLICATION_VOIP, &err);
-  if (err != OPUS_OK || !this->opus_encoder_) {
-    ESP_LOGE(TAG, "Opus encoder create failed: %d", err);
+bool JarvisWsAudio::init_pcm_send_buffer_() {
+  // Allocate buffer for one PCM frame (320 samples × 2 bytes = 640 bytes)
+  this->pcm_send_buffer_ = (uint8_t *)heap_caps_malloc(
+      PCM_FRAME_BYTES, MALLOC_CAP_SPIRAM | MALLOC_CAP_8BIT);
+  if (!this->pcm_send_buffer_) {
+    ESP_LOGE(TAG, "PCM send buffer alloc failed");
     return false;
   }
 
-  opus_encoder_ctl(this->opus_encoder_, OPUS_SET_BITRATE(OPUS_BITRATE_VAL));
-  opus_encoder_ctl(this->opus_encoder_, OPUS_SET_COMPLEXITY(OPUS_COMPLEXITY_VAL));
-  opus_encoder_ctl(this->opus_encoder_, OPUS_SET_SIGNAL(OPUS_SIGNAL_VOICE));
-
-  this->enc_input_buffer_ = (int16_t *)heap_caps_malloc(
-      OPUS_FRAME_SAMPLES * sizeof(int16_t), MALLOC_CAP_SPIRAM | MALLOC_CAP_8BIT);
-  this->enc_output_buffer_ = (uint8_t *)heap_caps_malloc(
-      OPUS_MAX_PACKET_SIZE, MALLOC_CAP_SPIRAM | MALLOC_CAP_8BIT);
-
-  if (!this->enc_input_buffer_ || !this->enc_output_buffer_) {
-    ESP_LOGE(TAG, "Opus buffer alloc failed");
-    return false;
-  }
-
-  ESP_LOGI(TAG, "Opus encoder: %dHz mono, bitrate=%d, complexity=%d",
-           SAMPLE_RATE, OPUS_BITRATE_VAL, OPUS_COMPLEXITY_VAL);
+  ESP_LOGI(TAG, "PCM send: %dHz 16-bit mono, frame=%d bytes (%d samples)",
+           SAMPLE_RATE, PCM_FRAME_BYTES, PCM_FRAME_SAMPLES);
   return true;
 }
 
@@ -836,11 +827,6 @@ void JarvisWsAudio::start_session() {
   }
   // Reset ring buffer for fresh audio (mic is already running via MWW)
   this->mic_buffer_read_pos_ = this->mic_buffer_write_pos_;
-  // Reset Opus encoder state — clear internal SILK predictors/state from previous session
-  // Without this, the first few frames of a new session may have encoding artifacts
-  if (this->opus_encoder_) {
-    opus_encoder_ctl(this->opus_encoder_, OPUS_RESET_STATE);
-  }
   this->audio_session_requested_ = true;
   // Reset debug flag so we log the first frame of each new session
   this->debug_first_frame_ = true;
