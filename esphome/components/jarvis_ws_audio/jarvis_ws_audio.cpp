@@ -47,7 +47,7 @@ static constexpr int OPUS_COMPLEXITY_VAL = 0;
 // Voice PE I2S mic: 32-bit stereo (bits_per_sample: 32bit, channel: stereo)
 // Each stereo sample pair = 8 bytes: [L0 L1 L2 L3 R0 R1 R2 R3] (little-endian)
 static constexpr int MIC_BYTES_PER_STEREO_PAIR = 8;   // 4 bytes/ch × 2 channels
-static constexpr int MIC_CHANNEL_OFFSET = 0;           // 0 = left channel, 4 = right channel
+static constexpr int MIC_CHANNEL_OFFSET = 4;           // 4 = right channel (XMOS processed audio, matches MWW channels: 1)
 static constexpr int MIC_GAIN_FACTOR = 4;              // Same as MWW gain_factor: 4
 
 // --- Timing constants ---
@@ -323,6 +323,23 @@ void JarvisWsAudio::process_audio_session_() {
     if (available < frame_bytes)
       break;
 
+    // Debug: log first frame's channel data for diagnosis
+    if (this->debug_first_frame_) {
+      this->debug_first_frame_ = false;
+      size_t base = this->mic_buffer_read_pos_ % buf_size;
+      // Show first stereo pair raw bytes
+      ESP_LOGI(TAG, "First stereo pair [%02X %02X %02X %02X | %02X %02X %02X %02X]",
+               this->mic_buffer_[base], this->mic_buffer_[(base+1)%buf_size],
+               this->mic_buffer_[(base+2)%buf_size], this->mic_buffer_[(base+3)%buf_size],
+               this->mic_buffer_[(base+4)%buf_size], this->mic_buffer_[(base+5)%buf_size],
+               this->mic_buffer_[(base+6)%buf_size], this->mic_buffer_[(base+7)%buf_size]);
+      // Show upper 16 bits of both channels for comparison
+      int16_t left = (int16_t)((this->mic_buffer_[(base+3)%buf_size] << 8) | this->mic_buffer_[(base+2)%buf_size]);
+      int16_t right = (int16_t)((this->mic_buffer_[(base+7)%buf_size] << 8) | this->mic_buffer_[(base+6)%buf_size]);
+      ESP_LOGI(TAG, "Ch0(left)=%d Ch1(right)=%d (using ch%d, offset=%d)",
+               left, right, MIC_CHANNEL_OFFSET / 4, MIC_CHANNEL_OFFSET);
+    }
+
     // Convert 32-bit stereo → 16-bit mono (one channel, upper 16 bits, with gain)
     // Stereo pair layout (little-endian): [L0 L1 L2 L3 R0 R1 R2 R3]
     // Upper 16 bits of 32-bit LE sample = bytes [2] and [3] (relative to channel start)
@@ -381,6 +398,14 @@ void JarvisWsAudio::process_tts_playback_() {
   if (!this->opus_decoder_ || !this->dec_output_buffer_ || !this->speaker_)
     return;
 
+  // Start the speaker on first frame (deferred from WS callback to audio task context)
+  if (!this->tts_speaker_started_ && this->tts_queue_read_ != this->tts_queue_write_) {
+    this->speaker_->set_audio_stream_info(audio::AudioStreamInfo(16, 1, SAMPLE_RATE));
+    this->speaker_->start();
+    this->tts_speaker_started_ = true;
+    ESP_LOGI(TAG, "Speaker started for TTS (%dHz 16-bit mono)", SAMPLE_RATE);
+  }
+
   // Decode all available frames from the queue
   while (this->tts_queue_read_ != this->tts_queue_write_) {
     TtsFrame &frame = this->tts_queue_[this->tts_queue_read_];
@@ -404,6 +429,10 @@ void JarvisWsAudio::process_tts_playback_() {
   // Check if TTS is complete: server sent tts_done AND queue is drained
   if (this->tts_done_received_ && this->tts_queue_read_ == this->tts_queue_write_) {
     ESP_LOGI(TAG, "Internal TTS playback finished");
+    if (this->tts_speaker_started_) {
+      this->speaker_->stop();
+      this->tts_speaker_started_ = false;
+    }
     this->tts_playing_ = false;
     this->tts_done_received_ = false;
     // Signal tts_done_pending to transition to idle (processed in loop)
@@ -653,8 +682,12 @@ void JarvisWsAudio::on_ws_text_message_(const char *data, int len) {
       this->tts_queue_read_ = 0;
       this->tts_queue_write_ = 0;
       this->tts_done_received_ = false;
+      this->tts_speaker_started_ = false;  // will be started on first frame in process_tts_playback_
       this->tts_playing_ = true;
-      ESP_LOGI(TAG, "Internal TTS playback starting");
+      ESP_LOGI(TAG, "Internal TTS playback starting (speaker_type=%s)", this->speaker_type_.c_str());
+    } else {
+      ESP_LOGI(TAG, "TTS via external speaker (speaker_type=%s, speaker=%p, decoder=%p)",
+               this->speaker_type_.c_str(), this->speaker_, this->opus_decoder_);
     }
 
   } else if (strcmp(type, "tts_done") == 0) {
@@ -759,6 +792,9 @@ void JarvisWsAudio::start_session() {
   // Reset ring buffer for fresh audio (mic is already running via MWW)
   this->mic_buffer_read_pos_ = this->mic_buffer_write_pos_;
   this->audio_session_requested_ = true;
+  // Reset debug flag so we log the first frame of each new session
+  // (static variable in process_audio_session_ — reset via external flag)
+  this->debug_first_frame_ = true;
 }
 
 void JarvisWsAudio::stop_session() {

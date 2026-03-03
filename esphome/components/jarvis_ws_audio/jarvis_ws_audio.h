@@ -22,6 +22,7 @@
 #include "esphome/core/automation.h"
 #include "esphome/components/microphone/microphone.h"
 #include "esphome/components/speaker/speaker.h"
+#include "esphome/components/audio/audio.h"
 #include <string>
 
 // ESP-IDF WebSocket client (same library as AtomS3R)
@@ -152,6 +153,7 @@ class JarvisWsAudio : public Component {
   int tts_queue_read_{0};
   volatile bool tts_playing_{false};
   volatile bool tts_done_received_{false};  // server sent tts_done, drain queue then stop
+  bool tts_speaker_started_{false};          // speaker_->start() called for current TTS session
 
   // --- Audio encoding task (runs opus_encode on separate stack) ---
   TaskHandle_t audio_task_handle_{nullptr};
@@ -176,6 +178,9 @@ class JarvisWsAudio : public Component {
 
   // --- Speaker type (set by orchestrator via config_update) ---
   std::string speaker_type_{"alexa"};  // "alexa" or "internal"
+
+  // --- Debug ---
+  volatile bool debug_first_frame_{true};  // Log first audio frame of each session
 
   // --- Internal methods ---
   bool init_opus_encoder_();

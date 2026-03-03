@@ -21,11 +21,11 @@ import esphome.codegen as cg
 import esphome.config_validation as cv
 from esphome import automation
 from esphome.const import CONF_ID, CONF_MICROPHONE
-from esphome.components import microphone, speaker
+from esphome.components import audio, microphone, speaker
 from esphome.components.esp32 import add_idf_component
 
 DEPENDENCIES = ["network", "microphone"]
-AUTO_LOAD = ["microphone"]
+AUTO_LOAD = ["microphone", "audio"]
 
 CONF_SPEAKER = "speaker"
 CODEOWNERS = ["@jarvis"]
