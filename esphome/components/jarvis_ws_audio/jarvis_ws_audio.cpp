@@ -36,19 +36,19 @@ namespace jarvis_ws_audio {
 
 static const char *const TAG = "jarvis_ws_audio";
 
-// --- Audio constants (identical to AtomS3R) ---
+// --- Audio constants ---
 static constexpr int SAMPLE_RATE = 16000;
 static constexpr int OPUS_FRAME_SAMPLES = 320;       // 20ms @ 16kHz
 static constexpr int OPUS_MAX_PACKET_SIZE = 1276;
-static constexpr int OPUS_BITRATE_VAL = 30000;
-static constexpr int OPUS_COMPLEXITY_VAL = 0;
+static constexpr int OPUS_BITRATE_VAL = 48000;        // 48kbps (was 30k — more headroom for speech quality)
+static constexpr int OPUS_COMPLEXITY_VAL = 5;          // Moderate complexity (was 0 — ESP32-S3 can handle it)
 
 // --- Microphone format constants ---
 // Voice PE I2S mic: 32-bit stereo (bits_per_sample: 32bit, channel: stereo)
 // Each stereo sample pair = 8 bytes: [L0 L1 L2 L3 R0 R1 R2 R3] (little-endian)
+// Channel extraction happens in the mic callback — ring buffer stores 16-bit mono
 static constexpr int MIC_BYTES_PER_STEREO_PAIR = 8;   // 4 bytes/ch × 2 channels
-static constexpr int MIC_CHANNEL_OFFSET = 0;           // 0 = left channel (XMOS processed/beamformed audio)
-static constexpr int MIC_GAIN_FACTOR = 1;              // No gain — XMOS DSP output is already amplified (gain×4 causes clipping)
+static constexpr int MIC_BYTES_PER_MONO_SAMPLE = 2;   // 16-bit mono output in ring buffer
 
 // --- Timing constants ---
 static constexpr uint32_t SESSION_TIMEOUT_MS = 30000;  // 30s max audio session
@@ -86,10 +86,10 @@ void JarvisWsAudio::setup() {
     return;
   }
 
-  // Allocate mic buffer from PSRAM (ring buffer for raw bytes from ESPHome microphone)
-  // Mic delivers 32-bit stereo @ 16kHz = 128000 bytes/sec; 1 second buffer
-  // MUST use PSRAM — internal SRAM is too scarce for 128KB (causes OOM for I2S DMA)
-  this->mic_buffer_size_ = 128000;
+  // Allocate mic buffer from PSRAM (ring buffer for 16-bit mono samples)
+  // After channel extraction in callback: 16kHz × 2 bytes = 32000 bytes/sec; 1 second buffer
+  // MUST use PSRAM — internal SRAM is too scarce (causes OOM for I2S DMA)
+  this->mic_buffer_size_ = 32000;
   this->mic_buffer_ = (uint8_t *)heap_caps_calloc(this->mic_buffer_size_, 1,
                                                    MALLOC_CAP_SPIRAM | MALLOC_CAP_8BIT);
   if (!this->mic_buffer_) {
@@ -101,12 +101,23 @@ void JarvisWsAudio::setup() {
   this->mic_buffer_read_pos_ = 0;
 
   // Register microphone data callback
-  // ESPHome microphone delivers audio as std::vector<uint8_t> chunks (~16ms each)
+  // ESPHome microphone delivers 32-bit stereo audio as std::vector<uint8_t> chunks (~16ms each)
+  // We extract the LEFT channel (ch0) upper 16 bits here in the callback — same as ESPHome's
+  // MicrophoneSource::process_audio_() — so the ring buffer stores clean 16-bit mono samples.
+  // This avoids passing raw stereo data through PSRAM and simplifies the encoding task.
   this->microphone_->add_data_callback([this](const std::vector<uint8_t> &data) {
-    size_t buf_size = this->mic_buffer_size_;
-    for (size_t i = 0; i < data.size(); i++) {
-      this->mic_buffer_[this->mic_buffer_write_pos_ % buf_size] = data[i];
-      this->mic_buffer_write_pos_++;
+    const size_t buf_size = this->mic_buffer_size_;
+    const size_t num_frames = data.size() / MIC_BYTES_PER_STEREO_PAIR;
+    for (size_t i = 0; i < num_frames; i++) {
+      const size_t src = i * MIC_BYTES_PER_STEREO_PAIR;
+      // Left channel (ch0) upper 16 bits: bytes [2] and [3] of the 32-bit LE sample
+      const uint8_t lo = data[src + 2];
+      const uint8_t hi = data[src + 3];
+      // Write 16-bit mono sample to ring buffer (little-endian)
+      const size_t wp = this->mic_buffer_write_pos_;
+      this->mic_buffer_[wp % buf_size] = lo;
+      this->mic_buffer_[(wp + 1) % buf_size] = hi;
+      this->mic_buffer_write_pos_ = wp + MIC_BYTES_PER_MONO_SAMPLE;
     }
   });
 
@@ -313,8 +324,9 @@ void JarvisWsAudio::process_audio_session_() {
   if (!this->opus_encoder_ || !this->enc_input_buffer_ || !this->enc_output_buffer_)
     return;
 
-  // Mic delivers 32-bit stereo: each Opus frame needs 320 stereo pairs = 2560 bytes
-  const size_t frame_bytes = OPUS_FRAME_SAMPLES * MIC_BYTES_PER_STEREO_PAIR;
+  // Ring buffer now stores 16-bit mono samples (channel extraction done in callback)
+  // Each Opus frame = 320 samples × 2 bytes = 640 bytes
+  const size_t frame_bytes = OPUS_FRAME_SAMPLES * MIC_BYTES_PER_MONO_SAMPLE;
   const size_t buf_size = this->mic_buffer_size_;
 
   // Process all available complete frames
@@ -323,41 +335,28 @@ void JarvisWsAudio::process_audio_session_() {
     if (available < frame_bytes)
       break;
 
-    // Debug: log first frame's channel data for diagnosis
-    if (this->debug_first_frame_) {
-      this->debug_first_frame_ = false;
-      size_t base = this->mic_buffer_read_pos_ % buf_size;
-      // Show first stereo pair raw bytes
-      ESP_LOGI(TAG, "First stereo pair [%02X %02X %02X %02X | %02X %02X %02X %02X]",
-               this->mic_buffer_[base], this->mic_buffer_[(base+1)%buf_size],
-               this->mic_buffer_[(base+2)%buf_size], this->mic_buffer_[(base+3)%buf_size],
-               this->mic_buffer_[(base+4)%buf_size], this->mic_buffer_[(base+5)%buf_size],
-               this->mic_buffer_[(base+6)%buf_size], this->mic_buffer_[(base+7)%buf_size]);
-      // Show upper 16 bits of both channels for comparison
-      int16_t left = (int16_t)((this->mic_buffer_[(base+3)%buf_size] << 8) | this->mic_buffer_[(base+2)%buf_size]);
-      int16_t right = (int16_t)((this->mic_buffer_[(base+7)%buf_size] << 8) | this->mic_buffer_[(base+6)%buf_size]);
-      ESP_LOGI(TAG, "Ch0(left)=%d Ch1(right)=%d (using ch%d, offset=%d)",
-               left, right, MIC_CHANNEL_OFFSET / 4, MIC_CHANNEL_OFFSET);
-    }
-
-    // Convert 32-bit stereo → 16-bit mono (one channel, upper 16 bits, with gain)
-    // Stereo pair layout (little-endian): [L0 L1 L2 L3 R0 R1 R2 R3]
-    // Upper 16 bits of 32-bit LE sample = bytes [2] and [3] (relative to channel start)
+    // Read 16-bit mono samples directly from ring buffer into Opus input buffer
+    int32_t peak = 0;
     for (int i = 0; i < OPUS_FRAME_SAMPLES; i++) {
-      size_t pair_base = (this->mic_buffer_read_pos_ + i * MIC_BYTES_PER_STEREO_PAIR) % buf_size;
-      // Select channel and take upper 16 bits of the 32-bit sample
-      size_t sample_base = (pair_base + MIC_CHANNEL_OFFSET) % buf_size;
-      uint8_t lo = this->mic_buffer_[(sample_base + 2) % buf_size];
-      uint8_t hi = this->mic_buffer_[(sample_base + 3) % buf_size];
+      size_t pos = (this->mic_buffer_read_pos_ + i * MIC_BYTES_PER_MONO_SAMPLE) % buf_size;
+      uint8_t lo = this->mic_buffer_[pos];
+      uint8_t hi = this->mic_buffer_[(pos + 1) % buf_size];
       int16_t sample = (int16_t)((hi << 8) | lo);
-
-      // Apply gain (same as MWW gain_factor) with saturation
-      int32_t amplified = (int32_t)sample * MIC_GAIN_FACTOR;
-      if (amplified > 32767) amplified = 32767;
-      if (amplified < -32768) amplified = -32768;
-      this->enc_input_buffer_[i] = (int16_t)amplified;
+      this->enc_input_buffer_[i] = sample;
+      // Track peak for debug logging
+      int32_t abs_val = sample < 0 ? -sample : sample;
+      if (abs_val > peak) peak = abs_val;
     }
     this->mic_buffer_read_pos_ += frame_bytes;
+
+    // Debug: log first frame stats for diagnosis
+    if (this->debug_first_frame_) {
+      this->debug_first_frame_ = false;
+      ESP_LOGI(TAG, "First frame: peak=%ld, samples[0..3]=[%d,%d,%d,%d]",
+               (long)peak,
+               this->enc_input_buffer_[0], this->enc_input_buffer_[1],
+               this->enc_input_buffer_[2], this->enc_input_buffer_[3]);
+    }
 
     // Encode to Opus
     int encoded_size = opus_encode(this->opus_encoder_, this->enc_input_buffer_,
@@ -407,6 +406,7 @@ void JarvisWsAudio::process_tts_playback_() {
   }
 
   // Decode all available frames from the queue
+  int frames_decoded = 0;
   while (this->tts_queue_read_ != this->tts_queue_write_) {
     TtsFrame &frame = this->tts_queue_[this->tts_queue_read_];
 
@@ -419,11 +419,17 @@ void JarvisWsAudio::process_tts_playback_() {
       size_t pcm_bytes = decoded * sizeof(int16_t);
       // Write decoded PCM to speaker (speaker handles buffering internally)
       size_t written = this->speaker_->play((const uint8_t *)this->dec_output_buffer_, pcm_bytes);
+      frames_decoded++;
       if (written == 0) {
-        // Speaker buffer full — back off and retry next iteration
+        ESP_LOGW(TAG, "TTS speaker buffer full after %d frames", frames_decoded);
         break;
       }
+    } else {
+      ESP_LOGW(TAG, "TTS Opus decode error: %d", decoded);
     }
+  }
+  if (frames_decoded > 0 && frames_decoded % 50 == 0) {
+    ESP_LOGD(TAG, "TTS decoded %d frames this batch", frames_decoded);
   }
 
   // Check if TTS is complete: server sent tts_done AND queue is drained
@@ -555,6 +561,15 @@ bool JarvisWsAudio::connect_ws_() {
 void JarvisWsAudio::disconnect_ws_() {
   this->audio_session_active_ = false;
   this->voice_phase_ = PHASE_NOT_READY;
+  // Stop TTS speaker if active (safe to call from main loop context)
+  if (this->tts_speaker_started_ && this->speaker_) {
+    this->speaker_->stop();
+    this->tts_speaker_started_ = false;
+    ESP_LOGI(TAG, "Stopped TTS speaker on disconnect");
+  }
+  this->tts_playing_ = false;
+  this->tts_done_received_ = false;
+  this->tts_done_pending_ = false;
   if (this->ws_client_) {
     esp_websocket_client_stop(this->ws_client_);
     esp_websocket_client_destroy(this->ws_client_);
@@ -613,6 +628,14 @@ void JarvisWsAudio::on_ws_event_(int32_t event_id, esp_websocket_event_data_t *d
       this->voice_phase_ = PHASE_NOT_READY;
       this->audio_session_active_ = false;
       this->mic_stop_pending_ = true;  // defer mic stop to main loop
+      // Clean up TTS state to prevent residual playback on next connection
+      if (this->tts_playing_) {
+        ESP_LOGW(TAG, "Cleaning up TTS state on disconnect");
+        this->tts_playing_ = false;
+        this->tts_done_received_ = false;
+        this->tts_done_pending_ = false;
+        this->tts_speaker_started_ = false;
+      }
       break;
 
     case WEBSOCKET_EVENT_ERROR:
@@ -621,6 +644,13 @@ void JarvisWsAudio::on_ws_event_(int32_t event_id, esp_websocket_event_data_t *d
       this->voice_phase_ = PHASE_NOT_READY;
       this->audio_session_active_ = false;
       this->mic_stop_pending_ = true;  // defer mic stop to main loop
+      // Clean up TTS state
+      if (this->tts_playing_) {
+        this->tts_playing_ = false;
+        this->tts_done_received_ = false;
+        this->tts_done_pending_ = false;
+        this->tts_speaker_started_ = false;
+      }
       break;
 
     case WEBSOCKET_EVENT_CLOSED:
@@ -629,6 +659,14 @@ void JarvisWsAudio::on_ws_event_(int32_t event_id, esp_websocket_event_data_t *d
       this->voice_phase_ = PHASE_NOT_READY;
       this->audio_session_active_ = false;
       this->mic_stop_pending_ = true;
+      // Clean up TTS state
+      if (this->tts_playing_) {
+        ESP_LOGW(TAG, "Cleaning up TTS state on close");
+        this->tts_playing_ = false;
+        this->tts_done_received_ = false;
+        this->tts_done_pending_ = false;
+        this->tts_speaker_started_ = false;
+      }
       break;
 
     default:
@@ -798,9 +836,13 @@ void JarvisWsAudio::start_session() {
   }
   // Reset ring buffer for fresh audio (mic is already running via MWW)
   this->mic_buffer_read_pos_ = this->mic_buffer_write_pos_;
+  // Reset Opus encoder state — clear internal SILK predictors/state from previous session
+  // Without this, the first few frames of a new session may have encoding artifacts
+  if (this->opus_encoder_) {
+    opus_encoder_ctl(this->opus_encoder_, OPUS_RESET_STATE);
+  }
   this->audio_session_requested_ = true;
   // Reset debug flag so we log the first frame of each new session
-  // (static variable in process_audio_session_ — reset via external flag)
   this->debug_first_frame_ = true;
 }
 

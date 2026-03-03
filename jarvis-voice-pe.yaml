@@ -194,7 +194,7 @@ jarvis_ws_audio:
   server_url: !secret jarvis_server_url
   device_token: !secret jarvis_device_token
   microphone: i2s_mics
-  speaker: announcement_resampling_speaker
+  speaker: jarvis_tts_resampling_speaker
   wakeword_mode: local
   firmware_version: "1.0.0-nabuvoice"
 
@@ -258,7 +258,7 @@ speaker:
     timeout: never
     buffer_duration: 100ms
     audio_dac: aic3204_dac
-  # Mixer: combina announcement + media in un unico output
+  # Mixer: combina announcement + media + TTS JARVIS in un unico output
   - platform: mixer
     id: mixing_speaker
     output_speaker: i2s_audio_speaker
@@ -269,6 +269,8 @@ speaker:
         timeout: never
       - id: media_mixing_input
         timeout: never
+      - id: jarvis_tts_mixing_input
+        timeout: never
   # Resampler per ciascuna pipeline
   - platform: resampler
     id: announcement_resampling_speaker
@@ -278,6 +280,12 @@ speaker:
   - platform: resampler
     id: media_resampling_speaker
     output_speaker: media_mixing_input
+    sample_rate: 48000
+    bits_per_sample: 16
+  # Resampler dedicato per TTS JARVIS (indipendente dalla pipeline announcement del media player)
+  - platform: resampler
+    id: jarvis_tts_resampling_speaker
+    output_speaker: jarvis_tts_mixing_input
     sample_rate: 48000
     bits_per_sample: 16
 

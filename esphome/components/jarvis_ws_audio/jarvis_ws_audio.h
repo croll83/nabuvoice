@@ -169,10 +169,11 @@ class JarvisWsAudio : public Component {
   uint32_t last_volume_change_ms_{0};  // throttle volume_change messages
 
   // --- Audio buffer for microphone data ---
-  // ESPHome microphone provides data via callback (uint8_t); we accumulate here
-  // Allocated from PSRAM to avoid exhausting internal SRAM
+  // Mic callback extracts left channel (16-bit mono) from 32-bit stereo and stores here.
+  // Ring buffer holds clean 16-bit mono samples ready for Opus encoding.
+  // Allocated from PSRAM to avoid exhausting internal SRAM.
   uint8_t *mic_buffer_{nullptr};
-  size_t mic_buffer_size_{0};
+  size_t mic_buffer_size_{0};          // 32000 bytes = 1 second of 16-bit mono @ 16kHz
   volatile size_t mic_buffer_write_pos_{0};
   size_t mic_buffer_read_pos_{0};
 
