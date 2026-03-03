@@ -402,14 +402,30 @@ void JarvisWsAudio::process_tts_playback_() {
     return;
 
   // Start the speaker on first frame (deferred from WS callback to audio task context)
-  if (!this->tts_speaker_started_ && this->tts_queue_read_ != this->tts_queue_write_) {
+  if (!this->tts_speaker_started_ &&
+      (this->tts_pcm_pending_ || this->tts_queue_read_ != this->tts_queue_write_)) {
     this->speaker_->set_audio_stream_info(audio::AudioStreamInfo(16, 1, SAMPLE_RATE));
     this->speaker_->start();
     this->tts_speaker_started_ = true;
     ESP_LOGI(TAG, "Speaker started for TTS (%dHz 16-bit mono)", SAMPLE_RATE);
   }
 
-  // Decode all available frames from the queue
+  // First: flush any pending PCM from a previous decode cycle
+  if (this->tts_pcm_pending_) {
+    const uint8_t *pcm_ptr = (const uint8_t *)this->dec_output_buffer_ + this->tts_pcm_written_;
+    size_t remaining = this->tts_pcm_pending_size_ - this->tts_pcm_written_;
+    size_t written = this->speaker_->play(pcm_ptr, remaining);
+    this->tts_pcm_written_ += written;
+    if (this->tts_pcm_written_ >= this->tts_pcm_pending_size_) {
+      // Fully flushed
+      this->tts_pcm_pending_ = false;
+    } else {
+      // Still can't fit — speaker buffer still full, try again next cycle
+      return;
+    }
+  }
+
+  // Decode new frames from the queue
   int frames_decoded = 0;
   while (this->tts_queue_read_ != this->tts_queue_write_) {
     TtsFrame &frame = this->tts_queue_[this->tts_queue_read_];
@@ -417,27 +433,32 @@ void JarvisWsAudio::process_tts_playback_() {
     int decoded = opus_decode(this->opus_decoder_,
                               frame.data, frame.length,
                               this->dec_output_buffer_, OPUS_FRAME_SAMPLES, 0);
+    if (decoded <= 0) {
+      ESP_LOGW(TAG, "TTS Opus decode error: %d", decoded);
+      this->tts_queue_read_ = (this->tts_queue_read_ + 1) % TTS_QUEUE_SLOTS;
+      continue;
+    }
+
+    // Advance queue AFTER successful decode
     this->tts_queue_read_ = (this->tts_queue_read_ + 1) % TTS_QUEUE_SLOTS;
 
-    if (decoded > 0) {
-      size_t pcm_bytes = decoded * sizeof(int16_t);
-      // Write decoded PCM to speaker (speaker handles buffering internally)
-      size_t written = this->speaker_->play((const uint8_t *)this->dec_output_buffer_, pcm_bytes);
-      frames_decoded++;
-      if (written == 0) {
-        ESP_LOGW(TAG, "TTS speaker buffer full after %d frames", frames_decoded);
-        break;
-      }
-    } else {
-      ESP_LOGW(TAG, "TTS Opus decode error: %d", decoded);
+    size_t pcm_bytes = decoded * sizeof(int16_t);
+    size_t written = this->speaker_->play((const uint8_t *)this->dec_output_buffer_, pcm_bytes);
+    frames_decoded++;
+
+    if (written < pcm_bytes) {
+      // Speaker buffer full or partial write — save remainder for next cycle
+      this->tts_pcm_pending_ = true;
+      this->tts_pcm_pending_size_ = pcm_bytes;
+      this->tts_pcm_written_ = written;
+      ESP_LOGD(TAG, "TTS speaker buffer full, %d/%d bytes pending", (int)(pcm_bytes - written), (int)pcm_bytes);
+      break;
     }
   }
-  if (frames_decoded > 0 && frames_decoded % 50 == 0) {
-    ESP_LOGD(TAG, "TTS decoded %d frames this batch", frames_decoded);
-  }
 
-  // Check if TTS is complete: server sent tts_done AND queue is drained
-  if (this->tts_done_received_ && this->tts_queue_read_ == this->tts_queue_write_) {
+  // Check if TTS is complete: server sent tts_done AND queue drained AND no pending PCM
+  if (this->tts_done_received_ && this->tts_queue_read_ == this->tts_queue_write_
+      && !this->tts_pcm_pending_) {
     ESP_LOGI(TAG, "Internal TTS playback finished");
     if (this->tts_speaker_started_) {
       this->speaker_->stop();
@@ -561,6 +582,7 @@ void JarvisWsAudio::disconnect_ws_() {
   this->tts_playing_ = false;
   this->tts_done_received_ = false;
   this->tts_done_pending_ = false;
+  this->tts_pcm_pending_ = false;
   if (this->ws_client_) {
     esp_websocket_client_stop(this->ws_client_);
     esp_websocket_client_destroy(this->ws_client_);
@@ -626,6 +648,7 @@ void JarvisWsAudio::on_ws_event_(int32_t event_id, esp_websocket_event_data_t *d
         this->tts_done_received_ = false;
         this->tts_done_pending_ = false;
         this->tts_speaker_started_ = false;
+        this->tts_pcm_pending_ = false;
       }
       break;
 
@@ -641,6 +664,7 @@ void JarvisWsAudio::on_ws_event_(int32_t event_id, esp_websocket_event_data_t *d
         this->tts_done_received_ = false;
         this->tts_done_pending_ = false;
         this->tts_speaker_started_ = false;
+        this->tts_pcm_pending_ = false;
       }
       break;
 
@@ -657,6 +681,7 @@ void JarvisWsAudio::on_ws_event_(int32_t event_id, esp_websocket_event_data_t *d
         this->tts_done_received_ = false;
         this->tts_done_pending_ = false;
         this->tts_speaker_started_ = false;
+        this->tts_pcm_pending_ = false;
       }
       break;
 
@@ -714,6 +739,7 @@ void JarvisWsAudio::on_ws_text_message_(const char *data, int len) {
         this->tts_queue_write_ = 0;
         this->tts_done_received_ = false;
         this->tts_speaker_started_ = false;  // will be started on first frame in process_tts_playback_
+        this->tts_pcm_pending_ = false;      // clear any stale pending PCM
         this->tts_playing_ = true;
         ESP_LOGI(TAG, "Internal TTS playback starting (speaker_type=%s)", this->speaker_type_.c_str());
       } else {

@@ -152,6 +152,9 @@ class JarvisWsAudio : public Component {
   volatile bool tts_playing_{false};
   volatile bool tts_done_received_{false};  // server sent tts_done, drain queue then stop
   bool tts_speaker_started_{false};          // speaker_->start() called for current TTS session
+  bool tts_pcm_pending_{false};              // decoded PCM waiting to be written to speaker
+  size_t tts_pcm_pending_size_{0};           // total bytes of pending decoded PCM
+  size_t tts_pcm_written_{0};               // bytes already written from pending PCM
 
   // --- Audio encoding task (runs opus_encode on separate stack) ---
   TaskHandle_t audio_task_handle_{nullptr};
