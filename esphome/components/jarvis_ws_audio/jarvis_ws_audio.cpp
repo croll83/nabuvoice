@@ -90,6 +90,32 @@ void JarvisWsAudio::setup() {
     }
   });
 
+  // Create dedicated FreeRTOS task for Opus encoding.
+  // opus_encode → silk_Encode uses ~10KB+ stack, too much for ESPHome's loopTask.
+  // Task stack is allocated from PSRAM to preserve internal RAM.
+  this->audio_task_stack_ = (StackType_t *)heap_caps_malloc(
+      32768, MALLOC_CAP_SPIRAM | MALLOC_CAP_8BIT);
+  if (!this->audio_task_stack_) {
+    ESP_LOGE(TAG, "Failed to allocate audio task stack from PSRAM");
+    this->mark_failed();
+    return;
+  }
+  this->audio_task_handle_ = xTaskCreateStaticPinnedToCore(
+      &JarvisWsAudio::audio_encode_task_,
+      "jarvis_audio_enc",
+      32768,    // 32KB stack
+      this,
+      5,        // Priority
+      this->audio_task_stack_,
+      &this->audio_task_tcb_,
+      1         // Core 1
+  );
+  if (!this->audio_task_handle_) {
+    ESP_LOGE(TAG, "Failed to create audio encode task");
+    this->mark_failed();
+    return;
+  }
+
   ESP_LOGI(TAG, "JARVIS WS Audio initialized (mode=%s)",
            this->server_wakeword_mode_ ? "server" : "local");
 }
@@ -140,9 +166,12 @@ void JarvisWsAudio::loop() {
     ESP_LOGI(TAG, "Audio session requested, sent audio_start");
   }
 
-  // --- Active audio session: read mic, encode Opus, send ---
+  // --- Active audio session: signal encoding task ---
   if (this->audio_session_active_ && this->conn_state_ == ConnState::STREAMING) {
-    this->process_audio_session_();
+    // Signal the dedicated audio task to encode & send (opus runs on its own stack)
+    if (this->audio_task_handle_) {
+      xTaskNotifyGive(this->audio_task_handle_);
+    }
 
     // Session timeout
     if (now - this->audio_session_start_ms_ > SESSION_TIMEOUT_MS) {
@@ -284,6 +313,22 @@ void JarvisWsAudio::process_audio_session_() {
     if (encoded_size > 0) {
       esp_websocket_client_send_bin(this->ws_client_, (const char *)this->enc_output_buffer_,
                                     encoded_size, pdMS_TO_TICKS(100));
+    }
+  }
+}
+
+// =============================================================================
+// AUDIO ENCODE TASK (runs on dedicated FreeRTOS task with 32KB stack)
+// =============================================================================
+
+void JarvisWsAudio::audio_encode_task_(void *param) {
+  JarvisWsAudio *self = static_cast<JarvisWsAudio *>(param);
+  ESP_LOGI(TAG, "Audio encode task started");
+  while (true) {
+    // Wait for notification from loop(), or poll every 20ms
+    ulTaskNotifyTake(pdTRUE, pdMS_TO_TICKS(20));
+    if (self->audio_session_active_ && self->conn_state_ == ConnState::STREAMING) {
+      self->process_audio_session_();
     }
   }
 }

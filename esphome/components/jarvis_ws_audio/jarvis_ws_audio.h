@@ -29,6 +29,10 @@
 // Opus encoder (same as AtomS3R)
 #include <opus.h>
 
+// FreeRTOS (for dedicated audio encoding task)
+#include "freertos/FreeRTOS.h"
+#include "freertos/task.h"
+
 namespace esphome {
 namespace jarvis_ws_audio {
 
@@ -125,6 +129,12 @@ class JarvisWsAudio : public Component {
   OpusEncoder *opus_encoder_{nullptr};
   int16_t *enc_input_buffer_{nullptr};
   uint8_t *enc_output_buffer_{nullptr};
+
+  // --- Audio encoding task (runs opus_encode on separate stack) ---
+  TaskHandle_t audio_task_handle_{nullptr};
+  StackType_t *audio_task_stack_{nullptr};
+  StaticTask_t audio_task_tcb_;
+  static void audio_encode_task_(void *param);
 
   // --- Reconnection & watchdog ---
   uint32_t reconnect_delay_ms_{1000};
