@@ -47,8 +47,8 @@ static constexpr int OPUS_COMPLEXITY_VAL = 0;
 // Voice PE I2S mic: 32-bit stereo (bits_per_sample: 32bit, channel: stereo)
 // Each stereo sample pair = 8 bytes: [L0 L1 L2 L3 R0 R1 R2 R3] (little-endian)
 static constexpr int MIC_BYTES_PER_STEREO_PAIR = 8;   // 4 bytes/ch × 2 channels
-static constexpr int MIC_CHANNEL_OFFSET = 4;           // 4 = right channel (XMOS processed audio, matches MWW channels: 1)
-static constexpr int MIC_GAIN_FACTOR = 4;              // Same as MWW gain_factor: 4
+static constexpr int MIC_CHANNEL_OFFSET = 0;           // 0 = left channel (XMOS processed/beamformed audio)
+static constexpr int MIC_GAIN_FACTOR = 1;              // No gain — XMOS DSP output is already amplified (gain×4 causes clipping)
 
 // --- Timing constants ---
 static constexpr uint32_t SESSION_TIMEOUT_MS = 30000;  // 30s max audio session
@@ -679,12 +679,19 @@ void JarvisWsAudio::on_ws_text_message_(const char *data, int len) {
     this->voice_phase_ = PHASE_REPLYING;
     // Start internal speaker for TTS playback
     if (this->speaker_ && this->opus_decoder_ && this->speaker_type_ == "internal") {
-      this->tts_queue_read_ = 0;
-      this->tts_queue_write_ = 0;
-      this->tts_done_received_ = false;
-      this->tts_speaker_started_ = false;  // will be started on first frame in process_tts_playback_
-      this->tts_playing_ = true;
-      ESP_LOGI(TAG, "Internal TTS playback starting (speaker_type=%s)", this->speaker_type_.c_str());
+      if (!this->tts_playing_) {
+        // First tts_start: init queue and start fresh
+        this->tts_queue_read_ = 0;
+        this->tts_queue_write_ = 0;
+        this->tts_done_received_ = false;
+        this->tts_speaker_started_ = false;  // will be started on first frame in process_tts_playback_
+        this->tts_playing_ = true;
+        ESP_LOGI(TAG, "Internal TTS playback starting (speaker_type=%s)", this->speaker_type_.c_str());
+      } else {
+        // Subsequent tts_start (multi-chunk TTS): just clear tts_done flag, keep playing
+        this->tts_done_received_ = false;
+        ESP_LOGI(TAG, "TTS continuation (multi-chunk), already playing");
+      }
     } else {
       ESP_LOGI(TAG, "TTS via external speaker (speaker_type=%s, speaker=%p, decoder=%p)",
                this->speaker_type_.c_str(), this->speaker_, this->opus_decoder_);
