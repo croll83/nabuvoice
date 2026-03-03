@@ -21,11 +21,13 @@ import esphome.codegen as cg
 import esphome.config_validation as cv
 from esphome import automation
 from esphome.const import CONF_ID, CONF_MICROPHONE
-from esphome.components import microphone
+from esphome.components import microphone, speaker
 from esphome.components.esp32 import add_idf_component
 
 DEPENDENCIES = ["network", "microphone"]
 AUTO_LOAD = ["microphone"]
+
+CONF_SPEAKER = "speaker"
 CODEOWNERS = ["@jarvis"]
 
 CONF_SERVER_URL = "server_url"
@@ -48,6 +50,7 @@ CONFIG_SCHEMA = cv.Schema({
     cv.Required(CONF_SERVER_URL): cv.string,
     cv.Optional(CONF_DEVICE_TOKEN, default=""): cv.string,
     cv.Required(CONF_MICROPHONE): cv.use_id(microphone.Microphone),
+    cv.Optional(CONF_SPEAKER): cv.use_id(speaker.Speaker),
     cv.Optional(CONF_WAKEWORD_MODE, default="local"): cv.one_of("local", "server", lower=True),
     cv.Optional(CONF_FIRMWARE_VERSION, default="1.0.0-voicepe"): cv.string,
 }).extend(cv.COMPONENT_SCHEMA)
@@ -63,6 +66,10 @@ async def to_code(config):
 
     mic = await cg.get_variable(config[CONF_MICROPHONE])
     cg.add(var.set_microphone(mic))
+
+    if CONF_SPEAKER in config:
+        spk = await cg.get_variable(config[CONF_SPEAKER])
+        cg.add(var.set_speaker(spk))
 
     if config[CONF_WAKEWORD_MODE] == "server":
         cg.add(var.set_server_wakeword_mode(True))

@@ -21,6 +21,7 @@
 #include "esphome/core/component.h"
 #include "esphome/core/automation.h"
 #include "esphome/components/microphone/microphone.h"
+#include "esphome/components/speaker/speaker.h"
 #include <string>
 
 // ESP-IDF WebSocket client (same library as AtomS3R)
@@ -57,6 +58,7 @@ class JarvisWsAudio : public Component {
   void set_device_token(const std::string &token) { this->device_token_ = token; }
   void set_firmware_version(const std::string &version) { this->firmware_version_ = version; }
   void set_microphone(microphone::Microphone *mic) { this->microphone_ = mic; }
+  void set_speaker(speaker::Speaker *spk) { this->speaker_ = spk; }
   void set_server_wakeword_mode(bool enabled) { this->server_wakeword_mode_ = enabled; }
 
   // --- Public actions (called from YAML automations) ---
@@ -87,12 +89,16 @@ class JarvisWsAudio : public Component {
   /** Voice phase for LED control (matches YAML substitution IDs) */
   int get_voice_phase() const { return this->voice_phase_; }
 
+  /** Speaker type from orchestrator config: "alexa" or "internal" */
+  const std::string &get_speaker_type() const { return this->speaker_type_; }
+
  protected:
   // --- Configuration ---
   std::string server_url_;
   std::string device_token_;
   std::string firmware_version_;
   microphone::Microphone *microphone_{nullptr};
+  speaker::Speaker *speaker_{nullptr};
   bool server_wakeword_mode_{false};
 
   // --- Connection state ---
@@ -130,6 +136,23 @@ class JarvisWsAudio : public Component {
   int16_t *enc_input_buffer_{nullptr};
   uint8_t *enc_output_buffer_{nullptr};
 
+  // --- Opus decoder (TTS playback) ---
+  OpusDecoder *opus_decoder_{nullptr};
+  int16_t *dec_output_buffer_{nullptr};  // decoded PCM (320 samples)
+
+  // --- TTS frame queue (incoming Opus frames from server) ---
+  static constexpr int TTS_QUEUE_SLOTS = 100;        // ~2 seconds of audio
+  static constexpr int TTS_MAX_FRAME_SIZE = 256;      // Max Opus frame bytes
+  struct TtsFrame {
+    uint16_t length;
+    uint8_t data[TTS_MAX_FRAME_SIZE];
+  };
+  TtsFrame *tts_queue_{nullptr};
+  volatile int tts_queue_write_{0};
+  int tts_queue_read_{0};
+  volatile bool tts_playing_{false};
+  volatile bool tts_done_received_{false};  // server sent tts_done, drain queue then stop
+
   // --- Audio encoding task (runs opus_encode on separate stack) ---
   TaskHandle_t audio_task_handle_{nullptr};
   StackType_t *audio_task_stack_{nullptr};
@@ -145,12 +168,18 @@ class JarvisWsAudio : public Component {
 
   // --- Audio buffer for microphone data ---
   // ESPHome microphone provides data via callback (uint8_t); we accumulate here
-  std::vector<uint8_t> mic_buffer_;
+  // Allocated from PSRAM to avoid exhausting internal SRAM
+  uint8_t *mic_buffer_{nullptr};
+  size_t mic_buffer_size_{0};
   volatile size_t mic_buffer_write_pos_{0};
   size_t mic_buffer_read_pos_{0};
 
+  // --- Speaker type (set by orchestrator via config_update) ---
+  std::string speaker_type_{"alexa"};  // "alexa" or "internal"
+
   // --- Internal methods ---
   bool init_opus_encoder_();
+  bool init_opus_decoder_();
   void build_ws_url_(char *buf, size_t buf_size);
   bool connect_ws_();
   void disconnect_ws_();
@@ -158,6 +187,7 @@ class JarvisWsAudio : public Component {
                   const char *extra_val = nullptr);
   bool send_hello_();
   void process_audio_session_();
+  void process_tts_playback_();
   void handle_deferred_flags_();
 
   // --- WebSocket event handler (static, ESP-IDF callback) ---

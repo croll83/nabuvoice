@@ -101,6 +101,13 @@ wifi:
     # Avvia wake word detection (XMOS DSP dovrebbe essere già pronto)
     - micro_wake_word.start:
     - lambda: id(init_in_progress) = false;
+    # Imposta volume iniziale speaker interno (il config arriverà dal server via WS)
+    - lambda: |-
+        if (id(external_media_player).volume < 0.4f) {
+          auto call = id(external_media_player).make_call();
+          call.set_volume(0.6f);
+          call.perform();
+        }
     - script.execute: control_leds
   on_disconnect:
     - micro_wake_word.stop:
@@ -117,6 +124,7 @@ logger:
 # API HA: mantenuto per OTA monitoring e controllo LED da HA (opzionale)
 api:
   id: api_id
+  reboot_timeout: 0s  # Non riavviare se HA non è connesso — usiamo JARVIS via WebSocket
   on_client_connected:
     - script.execute: control_leds
   on_client_disconnected:
@@ -186,6 +194,7 @@ jarvis_ws_audio:
   server_url: !secret jarvis_server_url
   device_token: !secret jarvis_device_token
   microphone: i2s_mics
+  speaker: announcement_resampling_speaker
   wakeword_mode: local
   firmware_version: "1.0.0-nabuvoice"
 
@@ -897,11 +906,6 @@ light:
               it[9] = muted_color;
               it[10] = Color::BLACK;
             }
-            if ( id(external_media_player).volume == 0.0f || id(external_media_player).is_muted() ) {
-              it[5] = Color::BLACK;
-              it[6] = muted_color;
-              it[7] = Color::BLACK;
-            }
       - addressable_lambda:
           name: "Voice kit startup failed"
           lambda: |-
@@ -921,17 +925,25 @@ light:
             auto light_color = id(led_ring).current_values;
             Color color(light_color.get_red() * 255, light_color.get_green() * 255,
                   light_color.get_blue() * 255);
-            Color silenced_color(255, 0, 0);
-            auto volume_ratio = 12.0f * id(external_media_player).volume;
-            for (uint8_t i = 0; i < 12; i++) {
-              if (i <= volume_ratio) {
-                it[(6+i)%12] = color * min( 255.0f * (volume_ratio - i) , 255.0f ) ;
-              } else {
-                it[(6+i)%12] = Color::BLACK;
+            if (id(jarvis_audio).get_speaker_type() == "internal") {
+              // Speaker interno: barra volume basata su media player locale
+              Color silenced_color(255, 0, 0);
+              auto volume_ratio = 12.0f * id(external_media_player).volume;
+              for (uint8_t i = 0; i < 12; i++) {
+                if (i <= volume_ratio) {
+                  it[(6+i)%12] = color * min( 255.0f * (volume_ratio - i) , 255.0f ) ;
+                } else {
+                  it[(6+i)%12] = Color::BLACK;
+                }
               }
-            }
-            if (id(external_media_player).volume == 0.0f) {
-              it[6] = silenced_color;
+              if (id(external_media_player).volume == 0.0f) {
+                it[6] = silenced_color;
+              }
+            } else {
+              // Alexa Echo: flash colore su tutto il ring (volume gestito dal server)
+              for (uint8_t i = 0; i < 12; i++) {
+                it[i] = color;
+              }
             }
       - addressable_lambda:
           name: "Center Button Touched"
@@ -1425,9 +1437,17 @@ script:
       increase_volume: bool
     then:
       - delay: 16ms
-      # Invia volume_change al wakeword server → orchestrator → Echo
+      # Volume condizionale: internal → media player locale, alexa → orchestrator
       - lambda: |-
-          id(jarvis_audio).send_volume_change(increase_volume ? "up" : "down");
+          if (id(jarvis_audio).get_speaker_type() == "internal") {
+            auto call = id(external_media_player).make_call();
+            call.set_command(increase_volume
+              ? media_player::MediaPlayerCommand::MEDIA_PLAYER_COMMAND_VOLUME_UP
+              : media_player::MediaPlayerCommand::MEDIA_PLAYER_COMMAND_VOLUME_DOWN);
+            call.perform();
+          } else {
+            id(jarvis_audio).send_volume_change(increase_volume ? "up" : "down");
+          }
       - script.execute: control_leds
       - delay: 1s
       - lambda: id(dial_touched) = false;

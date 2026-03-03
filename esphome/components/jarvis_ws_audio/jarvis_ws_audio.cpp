@@ -74,23 +74,36 @@ void JarvisWsAudio::setup() {
   this->device_id_ = std::string(mac_str);
   ESP_LOGI(TAG, "Device ID (MAC): %s", this->device_id_.c_str());
 
-  // Initialize Opus encoder
+  // Initialize Opus encoder + decoder
   if (!this->init_opus_encoder_()) {
     ESP_LOGE(TAG, "Opus encoder init failed");
     this->mark_failed();
     return;
   }
+  if (this->speaker_ && !this->init_opus_decoder_()) {
+    ESP_LOGE(TAG, "Opus decoder init failed");
+    this->mark_failed();
+    return;
+  }
 
-  // Allocate mic buffer (ring buffer for raw bytes from ESPHome microphone)
+  // Allocate mic buffer from PSRAM (ring buffer for raw bytes from ESPHome microphone)
   // Mic delivers 32-bit stereo @ 16kHz = 128000 bytes/sec; 1 second buffer
-  this->mic_buffer_.resize(128000, 0);
+  // MUST use PSRAM — internal SRAM is too scarce for 128KB (causes OOM for I2S DMA)
+  this->mic_buffer_size_ = 128000;
+  this->mic_buffer_ = (uint8_t *)heap_caps_calloc(this->mic_buffer_size_, 1,
+                                                   MALLOC_CAP_SPIRAM | MALLOC_CAP_8BIT);
+  if (!this->mic_buffer_) {
+    ESP_LOGE(TAG, "Failed to allocate mic buffer from PSRAM");
+    this->mark_failed();
+    return;
+  }
   this->mic_buffer_write_pos_ = 0;
   this->mic_buffer_read_pos_ = 0;
 
   // Register microphone data callback
   // ESPHome microphone delivers audio as std::vector<uint8_t> chunks (~16ms each)
   this->microphone_->add_data_callback([this](const std::vector<uint8_t> &data) {
-    size_t buf_size = this->mic_buffer_.size();
+    size_t buf_size = this->mic_buffer_size_;
     for (size_t i = 0; i < data.size(); i++) {
       this->mic_buffer_[this->mic_buffer_write_pos_ % buf_size] = data[i];
       this->mic_buffer_write_pos_++;
@@ -191,6 +204,11 @@ void JarvisWsAudio::loop() {
     }
   }
 
+  // --- TTS playback: signal audio task when frames are queued ---
+  if (this->tts_playing_ && this->audio_task_handle_) {
+    xTaskNotifyGive(this->audio_task_handle_);
+  }
+
   // --- Server wakeword mode: continuous Opus streaming when idle ---
   if (this->server_wakeword_mode_ &&
       this->conn_state_ == ConnState::CONNECTED &&
@@ -249,7 +267,8 @@ void JarvisWsAudio::handle_deferred_flags_() {
   }
 
   // tts_done from server (response delivered, go back to idle)
-  if (this->tts_done_pending_) {
+  // If TTS is playing on internal speaker, wait for queue to drain first
+  if (this->tts_done_pending_ && !this->tts_playing_) {
     this->tts_done_pending_ = false;
     ESP_LOGI(TAG, "TTS done — returning to idle");
     this->voice_phase_ = PHASE_IDLE;
@@ -296,7 +315,7 @@ void JarvisWsAudio::process_audio_session_() {
 
   // Mic delivers 32-bit stereo: each Opus frame needs 320 stereo pairs = 2560 bytes
   const size_t frame_bytes = OPUS_FRAME_SAMPLES * MIC_BYTES_PER_STEREO_PAIR;
-  const size_t buf_size = this->mic_buffer_.size();
+  const size_t buf_size = this->mic_buffer_size_;
 
   // Process all available complete frames
   while (true) {
@@ -347,6 +366,48 @@ void JarvisWsAudio::audio_encode_task_(void *param) {
     if (self->audio_session_active_ && self->conn_state_ == ConnState::STREAMING) {
       self->process_audio_session_();
     }
+    // TTS playback: decode queued Opus frames → speaker
+    if (self->tts_playing_) {
+      self->process_tts_playback_();
+    }
+  }
+}
+
+// =============================================================================
+// TTS PLAYBACK (decode Opus frames from server → internal speaker)
+// =============================================================================
+
+void JarvisWsAudio::process_tts_playback_() {
+  if (!this->opus_decoder_ || !this->dec_output_buffer_ || !this->speaker_)
+    return;
+
+  // Decode all available frames from the queue
+  while (this->tts_queue_read_ != this->tts_queue_write_) {
+    TtsFrame &frame = this->tts_queue_[this->tts_queue_read_];
+
+    int decoded = opus_decode(this->opus_decoder_,
+                              frame.data, frame.length,
+                              this->dec_output_buffer_, OPUS_FRAME_SAMPLES, 0);
+    this->tts_queue_read_ = (this->tts_queue_read_ + 1) % TTS_QUEUE_SLOTS;
+
+    if (decoded > 0) {
+      size_t pcm_bytes = decoded * sizeof(int16_t);
+      // Write decoded PCM to speaker (speaker handles buffering internally)
+      size_t written = this->speaker_->play((const uint8_t *)this->dec_output_buffer_, pcm_bytes);
+      if (written == 0) {
+        // Speaker buffer full — back off and retry next iteration
+        break;
+      }
+    }
+  }
+
+  // Check if TTS is complete: server sent tts_done AND queue is drained
+  if (this->tts_done_received_ && this->tts_queue_read_ == this->tts_queue_write_) {
+    ESP_LOGI(TAG, "Internal TTS playback finished");
+    this->tts_playing_ = false;
+    this->tts_done_received_ = false;
+    // Signal tts_done_pending to transition to idle (processed in loop)
+    this->tts_done_pending_ = true;
   }
 }
 
@@ -378,6 +439,33 @@ bool JarvisWsAudio::init_opus_encoder_() {
 
   ESP_LOGI(TAG, "Opus encoder: %dHz mono, bitrate=%d, complexity=%d",
            SAMPLE_RATE, OPUS_BITRATE_VAL, OPUS_COMPLEXITY_VAL);
+  return true;
+}
+
+bool JarvisWsAudio::init_opus_decoder_() {
+  int err;
+  this->opus_decoder_ = opus_decoder_create(SAMPLE_RATE, 1, &err);
+  if (err != OPUS_OK || !this->opus_decoder_) {
+    ESP_LOGE(TAG, "Opus decoder create failed: %d", err);
+    return false;
+  }
+
+  this->dec_output_buffer_ = (int16_t *)heap_caps_malloc(
+      OPUS_FRAME_SAMPLES * sizeof(int16_t), MALLOC_CAP_SPIRAM | MALLOC_CAP_8BIT);
+  if (!this->dec_output_buffer_) {
+    ESP_LOGE(TAG, "Opus decoder buffer alloc failed");
+    return false;
+  }
+
+  // TTS frame queue (PSRAM)
+  this->tts_queue_ = (TtsFrame *)heap_caps_calloc(
+      TTS_QUEUE_SLOTS, sizeof(TtsFrame), MALLOC_CAP_SPIRAM | MALLOC_CAP_8BIT);
+  if (!this->tts_queue_) {
+    ESP_LOGE(TAG, "TTS queue alloc failed");
+    return false;
+  }
+
+  ESP_LOGI(TAG, "Opus decoder: %dHz mono, TTS queue: %d slots", SAMPLE_RATE, TTS_QUEUE_SLOTS);
   return true;
 }
 
@@ -475,10 +563,19 @@ void JarvisWsAudio::on_ws_event_(int32_t event_id, esp_websocket_event_data_t *d
       if (data->op_code == 0x01 && data->data_ptr && data->data_len > 0) {
         // Text frame: JSON control message
         this->on_ws_text_message_(data->data_ptr, data->data_len);
+      } else if (data->op_code == 0x02 && data->data_ptr && data->data_len > 0) {
+        // Binary frame: TTS Opus from server → queue for playback
+        if (this->tts_playing_ && this->tts_queue_ &&
+            data->data_len <= TTS_MAX_FRAME_SIZE) {
+          int wr = this->tts_queue_write_;
+          int next_wr = (wr + 1) % TTS_QUEUE_SLOTS;
+          if (next_wr != this->tts_queue_read_) {  // not full
+            this->tts_queue_[wr].length = data->data_len;
+            memcpy(this->tts_queue_[wr].data, data->data_ptr, data->data_len);
+            this->tts_queue_write_ = next_wr;
+          }
+        }
       }
-      // Binary frames (TTS Opus from server) — not used for Voice PE
-      // (TTS goes through Alexa, not device speaker)
-      // But kept for future use / fallback local TTS
       break;
 
     case WEBSOCKET_EVENT_DISCONNECTED:
@@ -551,14 +648,32 @@ void JarvisWsAudio::on_ws_text_message_(const char *data, int len) {
   } else if (strcmp(type, "tts_start") == 0) {
     ESP_LOGI(TAG, "TTS started (replying)");
     this->voice_phase_ = PHASE_REPLYING;
+    // Start internal speaker for TTS playback
+    if (this->speaker_ && this->opus_decoder_ && this->speaker_type_ == "internal") {
+      this->tts_queue_read_ = 0;
+      this->tts_queue_write_ = 0;
+      this->tts_done_received_ = false;
+      this->tts_playing_ = true;
+      ESP_LOGI(TAG, "Internal TTS playback starting");
+    }
 
   } else if (strcmp(type, "tts_done") == 0) {
-    this->tts_done_pending_ = true;
+    if (this->tts_playing_) {
+      this->tts_done_received_ = true;  // drain queue before stopping
+    } else {
+      this->tts_done_pending_ = true;
+    }
 
   } else if (strcmp(type, "config_update") == 0) {
     cJSON *sens = cJSON_GetObjectItem(msg, "wake_word_sensitivity");
     if (sens && cJSON_IsNumber(sens)) {
       this->config_new_sensitivity_ = (float)sens->valuedouble;
+    }
+    // Speaker type: "alexa" or "internal"
+    const char *speaker = cJSON_GetStringValue(cJSON_GetObjectItem(msg, "speaker_type"));
+    if (speaker) {
+      this->speaker_type_ = std::string(speaker);
+      ESP_LOGI(TAG, "Speaker type updated: %s", speaker);
     }
     this->config_update_pending_ = true;
 
