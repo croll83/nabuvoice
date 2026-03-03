@@ -86,8 +86,6 @@ async def to_code(config):
     # Opus codec library (decoder only — used for TTS playback)
     add_idf_component(name="esphome/micro-opus", ref="0.3.4")
     cg.add_build_flag("-DUSE_JARVIS_WS_AUDIO")
-    # Force fixed-point SILK path — float (FLP) path crashes on ESP32
-    cg.add_build_flag("-DFIXED_POINT=1")
 
 
 # --- Automation Actions ---
