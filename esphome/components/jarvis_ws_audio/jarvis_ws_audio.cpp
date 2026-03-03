@@ -43,6 +43,13 @@ static constexpr int OPUS_MAX_PACKET_SIZE = 1276;
 static constexpr int OPUS_BITRATE_VAL = 30000;
 static constexpr int OPUS_COMPLEXITY_VAL = 0;
 
+// --- Microphone format constants ---
+// Voice PE I2S mic: 32-bit stereo (bits_per_sample: 32bit, channel: stereo)
+// Each stereo sample pair = 8 bytes: [L0 L1 L2 L3 R0 R1 R2 R3] (little-endian)
+static constexpr int MIC_BYTES_PER_STEREO_PAIR = 8;   // 4 bytes/ch × 2 channels
+static constexpr int MIC_CHANNEL_OFFSET = 0;           // 0 = left channel, 4 = right channel
+static constexpr int MIC_GAIN_FACTOR = 4;              // Same as MWW gain_factor: 4
+
 // --- Timing constants ---
 static constexpr uint32_t SESSION_TIMEOUT_MS = 30000;  // 30s max audio session
 static constexpr uint32_t RECONNECT_MIN_MS = 1000;
@@ -75,8 +82,8 @@ void JarvisWsAudio::setup() {
   }
 
   // Allocate mic buffer (ring buffer for raw bytes from ESPHome microphone)
-  // 2 seconds @ 16kHz, 16-bit mono = 64000 bytes
-  this->mic_buffer_.resize(64000, 0);
+  // Mic delivers 32-bit stereo @ 16kHz = 128000 bytes/sec; 1 second buffer
+  this->mic_buffer_.resize(128000, 0);
   this->mic_buffer_write_pos_ = 0;
   this->mic_buffer_read_pos_ = 0;
 
@@ -287,8 +294,8 @@ void JarvisWsAudio::process_audio_session_() {
   if (!this->opus_encoder_ || !this->enc_input_buffer_ || !this->enc_output_buffer_)
     return;
 
-  // Each Opus frame = 320 samples * 2 bytes = 640 bytes
-  const size_t frame_bytes = OPUS_FRAME_SAMPLES * sizeof(int16_t);
+  // Mic delivers 32-bit stereo: each Opus frame needs 320 stereo pairs = 2560 bytes
+  const size_t frame_bytes = OPUS_FRAME_SAMPLES * MIC_BYTES_PER_STEREO_PAIR;
   const size_t buf_size = this->mic_buffer_.size();
 
   // Process all available complete frames
@@ -297,12 +304,22 @@ void JarvisWsAudio::process_audio_session_() {
     if (available < frame_bytes)
       break;
 
-    // Copy bytes from ring buffer → int16_t input buffer (little-endian)
+    // Convert 32-bit stereo → 16-bit mono (one channel, upper 16 bits, with gain)
+    // Stereo pair layout (little-endian): [L0 L1 L2 L3 R0 R1 R2 R3]
+    // Upper 16 bits of 32-bit LE sample = bytes [2] and [3] (relative to channel start)
     for (int i = 0; i < OPUS_FRAME_SAMPLES; i++) {
-      size_t byte_pos = (this->mic_buffer_read_pos_ + i * 2) % buf_size;
-      uint8_t lo = this->mic_buffer_[byte_pos];
-      uint8_t hi = this->mic_buffer_[(byte_pos + 1) % buf_size];
-      this->enc_input_buffer_[i] = (int16_t)((hi << 8) | lo);
+      size_t pair_base = (this->mic_buffer_read_pos_ + i * MIC_BYTES_PER_STEREO_PAIR) % buf_size;
+      // Select channel and take upper 16 bits of the 32-bit sample
+      size_t sample_base = (pair_base + MIC_CHANNEL_OFFSET) % buf_size;
+      uint8_t lo = this->mic_buffer_[(sample_base + 2) % buf_size];
+      uint8_t hi = this->mic_buffer_[(sample_base + 3) % buf_size];
+      int16_t sample = (int16_t)((hi << 8) | lo);
+
+      // Apply gain (same as MWW gain_factor) with saturation
+      int32_t amplified = (int32_t)sample * MIC_GAIN_FACTOR;
+      if (amplified > 32767) amplified = 32767;
+      if (amplified < -32768) amplified = -32768;
+      this->enc_input_buffer_[i] = (int16_t)amplified;
     }
     this->mic_buffer_read_pos_ += frame_bytes;
 
