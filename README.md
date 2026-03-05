@@ -15,7 +15,6 @@ Creare `secrets.yaml` con:
 ```yaml
 jarvis_server_url: "ws://<wakeword-server-ip>:8200/ws/audio"
 jarvis_device_token: "<token>"
-jarvis_orchestrator_url: "http://<orchestrator-ip>:5000"
 
 wifi_ssid: "<ssid>"
 wifi_password: "<password>"

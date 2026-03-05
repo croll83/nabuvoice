@@ -32,7 +32,6 @@ CODEOWNERS = ["@jarvis"]
 
 CONF_SERVER_URL = "server_url"
 CONF_DEVICE_TOKEN = "device_token"
-CONF_ORCHESTRATOR_URL = "orchestrator_url"
 CONF_WAKEWORD_MODE = "wakeword_mode"
 CONF_FIRMWARE_VERSION = "firmware_version"
 
@@ -51,7 +50,6 @@ CONFIG_SCHEMA = cv.Schema({
     cv.GenerateID(): cv.declare_id(JarvisWsAudio),
     cv.Required(CONF_SERVER_URL): cv.string,
     cv.Optional(CONF_DEVICE_TOKEN, default=""): cv.string,
-    cv.Required(CONF_ORCHESTRATOR_URL): cv.string,
     cv.Required(CONF_MICROPHONE): cv.use_id(microphone.Microphone),
     cv.Optional(CONF_SPEAKER): cv.use_id(speaker.Speaker),
     cv.Optional(CONF_WAKEWORD_MODE, default="local"): cv.one_of("local", "server", lower=True),
@@ -65,7 +63,6 @@ async def to_code(config):
 
     cg.add(var.set_server_url(config[CONF_SERVER_URL]))
     cg.add(var.set_device_token(config[CONF_DEVICE_TOKEN]))
-    cg.add(var.set_orchestrator_url(config[CONF_ORCHESTRATOR_URL]))
     cg.add(var.set_firmware_version(config[CONF_FIRMWARE_VERSION]))
 
     mic = await cg.get_variable(config[CONF_MICROPHONE])

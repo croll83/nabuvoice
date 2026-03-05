@@ -193,7 +193,6 @@ jarvis_ws_audio:
   id: jarvis_audio
   server_url: !secret jarvis_server_url
   device_token: !secret jarvis_device_token
-  orchestrator_url: !secret jarvis_orchestrator_url
   microphone: i2s_mics
   speaker: jarvis_tts_resampling_speaker
   wakeword_mode: local

@@ -73,6 +73,24 @@ void JarvisWsAudio::setup() {
   this->device_id_ = std::string(mac_str);
   ESP_LOGI(TAG, "Device ID (MAC): %s", this->device_id_.c_str());
 
+  // Derive HTTP base URL from server_url_ (ws://host:port/path → http://host:port)
+  {
+    std::string url = this->server_url_;
+    // Replace ws:// → http://, wss:// → https://
+    if (url.compare(0, 6, "wss://") == 0) {
+      url = "https://" + url.substr(6);
+    } else if (url.compare(0, 5, "ws://") == 0) {
+      url = "http://" + url.substr(5);
+    }
+    // Strip path: find third slash (after http://host:port/)
+    auto pos = url.find('/', url.find("//") + 2);
+    if (pos != std::string::npos) {
+      url = url.substr(0, pos);
+    }
+    this->http_base_url_ = url;
+    ESP_LOGI(TAG, "HTTP base URL: %s", this->http_base_url_.c_str());
+  }
+
   // Initialize PCM send buffer + Opus decoder (for TTS playback)
   if (!this->init_pcm_send_buffer_()) {
     ESP_LOGE(TAG, "PCM send buffer init failed");
@@ -883,12 +901,12 @@ void JarvisWsAudio::send_volume_change(const std::string &direction) {
   if (now - this->last_volume_change_ms_ < 200) return;  // Throttle: max 5 per second
   this->last_volume_change_ms_ = now;
 
-  if (this->orchestrator_url_.empty()) {
-    ESP_LOGW(TAG, "send_volume_change: no orchestrator_url configured");
+  if (this->http_base_url_.empty()) {
+    ESP_LOGW(TAG, "send_volume_change: no http_base_url");
     return;
   }
 
-  std::string url = this->orchestrator_url_ + "/speaker/volume_change";
+  std::string url = this->http_base_url_ + "/speaker/volume_change";
   char json[96];
   snprintf(json, sizeof(json), "{\"device_id\":\"%s\",\"direction\":\"%s\"}",
            this->device_id_.c_str(), direction.c_str());
@@ -898,12 +916,12 @@ void JarvisWsAudio::send_volume_change(const std::string &direction) {
 }
 
 void JarvisWsAudio::send_speaker_suppress() {
-  if (this->orchestrator_url_.empty()) {
-    ESP_LOGW(TAG, "send_speaker_suppress: no orchestrator_url configured");
+  if (this->http_base_url_.empty()) {
+    ESP_LOGW(TAG, "send_speaker_suppress: no http_base_url");
     return;
   }
 
-  std::string url = this->orchestrator_url_ + "/speaker/suppress";
+  std::string url = this->http_base_url_ + "/speaker/suppress";
   char json[64];
   snprintf(json, sizeof(json), "{\"device_id\":\"%s\"}", this->device_id_.c_str());
 

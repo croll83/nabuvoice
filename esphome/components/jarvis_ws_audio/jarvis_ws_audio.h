@@ -63,7 +63,6 @@ class JarvisWsAudio : public Component {
   void set_firmware_version(const std::string &version) { this->firmware_version_ = version; }
   void set_microphone(microphone::Microphone *mic) { this->microphone_ = mic; }
   void set_speaker(speaker::Speaker *spk) { this->speaker_ = spk; }
-  void set_orchestrator_url(const std::string &url) { this->orchestrator_url_ = url; }
   void set_server_wakeword_mode(bool enabled) { this->server_wakeword_mode_ = enabled; }
 
   // --- Public actions (called from YAML automations) ---
@@ -104,7 +103,7 @@ class JarvisWsAudio : public Component {
   // --- Configuration ---
   std::string server_url_;
   std::string device_token_;
-  std::string orchestrator_url_;
+  std::string http_base_url_;  // Derived from server_url_ in setup(): ws://host:port/path → http://host:port
   std::string firmware_version_;
   microphone::Microphone *microphone_{nullptr};
   speaker::Speaker *speaker_{nullptr};
