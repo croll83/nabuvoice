@@ -193,6 +193,7 @@ jarvis_ws_audio:
   id: jarvis_audio
   server_url: !secret jarvis_server_url
   device_token: !secret jarvis_device_token
+  orchestrator_url: !secret jarvis_orchestrator_url
   microphone: i2s_mics
   speaker: jarvis_tts_resampling_speaker
   wakeword_mode: local
@@ -538,6 +539,7 @@ binary_sensor:
                                 condition:
                                   switch.is_off: master_mute_switch
                                 then:
+                                  - jarvis_ws_audio.speaker_suppress: jarvis_audio
                                   - script.execute:
                                       id: play_sound
                                       priority: true
@@ -1225,7 +1227,8 @@ micro_wake_word:
               then:
                 - jarvis_ws_audio.speaker_stop: jarvis_audio
               else:
-                # Any other wake word (hey_jarvis) → start session
+                # Any other wake word (hey_jarvis) → suppress speaker + start session
+                - jarvis_ws_audio.speaker_suppress: jarvis_audio
                 - if:
                     condition:
                       switch.is_on: wake_sound

@@ -882,12 +882,115 @@ void JarvisWsAudio::send_volume_change(const std::string &direction) {
   uint32_t now = millis();
   if (now - this->last_volume_change_ms_ < 200) return;  // Throttle: max 5 per second
   this->last_volume_change_ms_ = now;
-  ESP_LOGI(TAG, "Sending volume_change: %s", direction.c_str());
-  this->send_json_("volume_change", "direction", direction.c_str());
+
+  if (this->orchestrator_url_.empty()) {
+    ESP_LOGW(TAG, "send_volume_change: no orchestrator_url configured");
+    return;
+  }
+
+  std::string url = this->orchestrator_url_ + "/speaker/volume_change";
+  char json[96];
+  snprintf(json, sizeof(json), "{\"device_id\":\"%s\",\"direction\":\"%s\"}",
+           this->device_id_.c_str(), direction.c_str());
+
+  ESP_LOGI(TAG, "Volume change %s → %s", direction.c_str(), url.c_str());
+  http_post_fire_and_forget_(url.c_str(), json, this->device_token_.c_str());
+}
+
+void JarvisWsAudio::send_speaker_suppress() {
+  if (this->orchestrator_url_.empty()) {
+    ESP_LOGW(TAG, "send_speaker_suppress: no orchestrator_url configured");
+    return;
+  }
+
+  std::string url = this->orchestrator_url_ + "/speaker/suppress";
+  char json[64];
+  snprintf(json, sizeof(json), "{\"device_id\":\"%s\"}", this->device_id_.c_str());
+
+  ESP_LOGI(TAG, "Speaker suppress → %s", url.c_str());
+  http_post_fire_and_forget_(url.c_str(), json, this->device_token_.c_str());
 }
 
 void JarvisWsAudio::send_state(const std::string &state) {
   this->send_json_("state", "state", state.c_str());
+}
+
+// =============================================================================
+// HTTP POST fire-and-forget (for orchestrator calls)
+// =============================================================================
+
+struct HttpPostParams {
+  char *url;
+  char *json_body;
+  char *auth_token;  // nullable
+};
+
+static void http_post_task_(void *param) {
+  auto *p = static_cast<HttpPostParams *>(param);
+
+  esp_http_client_config_t config = {};
+  config.url = p->url;
+  config.method = HTTP_METHOD_POST;
+  config.timeout_ms = 3000;
+
+  esp_http_client_handle_t client = esp_http_client_init(&config);
+  if (client) {
+    esp_http_client_set_header(client, "Content-Type", "application/json");
+    if (p->auth_token && p->auth_token[0]) {
+      char auth_header[128];
+      snprintf(auth_header, sizeof(auth_header), "Bearer %s", p->auth_token);
+      esp_http_client_set_header(client, "Authorization", auth_header);
+    }
+    esp_http_client_set_post_field(client, p->json_body, strlen(p->json_body));
+
+    esp_err_t err = esp_http_client_perform(client);
+    if (err == ESP_OK) {
+      int status = esp_http_client_get_status_code(client);
+      ESP_LOGI("http_post", "POST %s → %d", p->url, status);
+    } else {
+      ESP_LOGW("http_post", "POST %s failed: %s", p->url, esp_err_to_name(err));
+    }
+    esp_http_client_cleanup(client);
+  } else {
+    ESP_LOGE("http_post", "Client init failed for %s", p->url);
+  }
+
+  free(p->url);
+  free(p->json_body);
+  free(p->auth_token);
+  free(p);
+  vTaskDelete(NULL);
+}
+
+void JarvisWsAudio::http_post_fire_and_forget_(const char *url, const char *json_body,
+                                                  const char *auth_token) {
+  auto *p = static_cast<HttpPostParams *>(malloc(sizeof(HttpPostParams)));
+  if (!p) {
+    ESP_LOGE("http_post", "malloc failed");
+    return;
+  }
+  p->url = strdup(url);
+  p->json_body = strdup(json_body);
+  p->auth_token = (auth_token && auth_token[0]) ? strdup(auth_token) : nullptr;
+
+  if (!p->url || !p->json_body) {
+    ESP_LOGE("http_post", "strdup failed");
+    free(p->url);
+    free(p->json_body);
+    free(p->auth_token);
+    free(p);
+    return;
+  }
+
+  BaseType_t ret = xTaskCreatePinnedToCore(
+      http_post_task_, "http_post", 4096, p, 3, nullptr, 1);
+  if (ret != pdPASS) {
+    ESP_LOGE("http_post", "xTaskCreate failed");
+    free(p->url);
+    free(p->json_body);
+    free(p->auth_token);
+    free(p);
+  }
 }
 
 }  // namespace jarvis_ws_audio
