@@ -42,6 +42,26 @@ esphome run jarvis-voice-pe.yaml --device jarvis-voice-XXXX.local
 esphome logs jarvis-voice-pe.yaml --device jarvis-voice-XXXX.local
 ```
 
+## Pulsante centrale
+
+| Gesto | Azione |
+|-------|--------|
+| Single click | Se streaming → stop sessione. Se announcement → stop. Altrimenti → avvia sessione JARVIS |
+| Double click | Speaker stop (ferma Echo/Alexa) + evento HA `double_press` |
+| Triple click | Evento HA `triple_press` (automazione custom) |
+| Long press | Spegne LED + evento HA `long_press` (automazione custom) |
+
+## LED Ring
+
+| Fase | Colore | Animazione |
+|------|--------|------------|
+| Listening (mic attivo) | Blu | Rotazione oraria |
+| Thinking (elaborazione) | Celeste | 2 LED pulsanti |
+| Replying (risposta TTS) | Bianco | Rotazione antioraria |
+| Error | Rosso | Pulsante |
+| Not ready | Rosso | Twinkle |
+| Idle | Spento | - |
+
 ## Struttura
 
 ```
